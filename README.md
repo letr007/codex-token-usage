@@ -11,7 +11,7 @@ It records usage events, estimates model cost, tracks Codex 5h and 7d/month quot
 - 401 invalid-auth protection until the auth JSON file is replaced or removed.
 - Optional quota trigger for refreshing observed Codex quota snapshots.
 - Provider pages for non-Codex OpenAI-compatible endpoints.
-- Built-in model price fallbacks with optional local override.
+- Built-in model price fallbacks plus automatic LiteLLM model price updates.
 
 ## Install Manually
 
@@ -42,19 +42,31 @@ plugins:
       最大并发账号数: 1
       单账号超时秒数: 20
       单账号最小冷却分钟: 10
+      自动更新模型价格表: true
+      模型价格更新间隔小时: 6
+      模型价格表地址: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
+      模型价格更新超时秒数: 20
 ```
 
 Quota trigger defaults to off. `quota` mode only queries quota state. `probe` mode can consume a small amount of tokens and should be enabled deliberately.
 
-## Optional Price Override
+## Model Price Table
 
-The plugin includes a default price table. To override or extend it, place a LiteLLM-style JSON file at:
+The plugin includes a small built-in fallback price table. By default it also downloads and refreshes the full LiteLLM-style model price table from:
+
+```text
+https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
+```
+
+The downloaded file is stored at:
 
 ```text
 /root/plugins/codex-token-usage/model_prices.json
 ```
 
-or set:
+The file is about 1.5 MB and is not bundled into release zips, so plugin binaries stay small and prices can be refreshed without rebuilding the plugin.
+
+To override the location, set:
 
 ```bash
 CPA_MODEL_PRICE_FILE=/path/to/model_prices.json

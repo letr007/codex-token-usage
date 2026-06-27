@@ -1245,6 +1245,67 @@ func TestProviderSpecificPricesDoNotOverrideGenericFallback(t *testing.T) {
 	}
 }
 
+func TestModelPriceUpdateConfigParsesChineseFields(t *testing.T) {
+	cfg := parsePluginConfigYAML([]byte(`
+自动更新模型价格表: false
+模型价格更新间隔小时: 12
+模型价格表地址: https://example.test/model_prices.json
+模型价格更新超时秒数: 9
+`), defaultPluginConfig())
+	cfg = normalizePluginConfig(cfg)
+	if cfg.ModelPriceAutoUpdateEnabled {
+		t.Fatalf("ModelPriceAutoUpdateEnabled = true, want false")
+	}
+	if cfg.ModelPriceUpdateIntervalHours != 12 {
+		t.Fatalf("ModelPriceUpdateIntervalHours = %d, want 12", cfg.ModelPriceUpdateIntervalHours)
+	}
+	if cfg.ModelPriceUpdateURL != "https://example.test/model_prices.json" {
+		t.Fatalf("ModelPriceUpdateURL = %q", cfg.ModelPriceUpdateURL)
+	}
+	if cfg.ModelPriceUpdateTimeoutSeconds != 9 {
+		t.Fatalf("ModelPriceUpdateTimeoutSeconds = %d, want 9", cfg.ModelPriceUpdateTimeoutSeconds)
+	}
+}
+
+func TestDownloadModelPricesValidatesAndWritesFile(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"openai/test-model": {
+				"input_cost_per_token": 0.000001,
+				"output_cost_per_token": 0.000002,
+				"litellm_provider": "openai"
+			}
+		}`))
+	}))
+	defer server.Close()
+	target := filepath.Join(t.TempDir(), "model_prices.json")
+	entries, loaded, size, err := downloadModelPrices(context.Background(), server.URL, target)
+	if err != nil {
+		t.Fatalf("downloadModelPrices returned error: %v", err)
+	}
+	if entries != 1 || loaded != 1 || size <= 0 {
+		t.Fatalf("entries=%d loaded=%d size=%d, want one loaded price", entries, loaded, size)
+	}
+	prices := readPricesFromPathForTest(t, target)
+	price, ok := prices["openai/test-model"]
+	if !ok {
+		t.Fatalf("downloaded prices = %#v, want openai/test-model", prices)
+	}
+	if price.Prompt != 1 || price.Completion != 2 {
+		t.Fatalf("price = %+v, want per-token values converted to per-million", price)
+	}
+}
+
+func readPricesFromPathForTest(t *testing.T, path string) map[string]modelPrice {
+	t.Helper()
+	t.Setenv("CPA_MODEL_PRICE_FILE", path)
+	old := globalModelPriceUpdater
+	globalModelPriceUpdater = &modelPriceUpdateManager{}
+	t.Cleanup(func() { globalModelPriceUpdater = old })
+	return readModelPricesFromFile()
+}
+
 func intToString(v int64) string {
 	return stringFromAny(v)
 }

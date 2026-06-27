@@ -74,10 +74,8 @@ func defaultModelPrices() map[string]modelPrice {
 }
 
 func readModelPricesFromFile() map[string]modelPrice {
-	path := strings.TrimSpace(os.Getenv("CPA_MODEL_PRICE_FILE"))
-	if path == "" {
-		path = "/root/plugins/codex-token-usage/model_prices.json"
-	}
+	globalModelPriceUpdater.ensureFresh()
+	path := modelPriceFilePath()
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil

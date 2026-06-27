@@ -61,13 +61,14 @@ const (
 )
 
 var (
-	pluginVersion    = "0.1.6"
+	pluginVersion    = "0.1.7"
 	pluginAuthor     = "Codex Token Usage Contributors"
 	pluginRepository = "https://github.com/zhumengling/codex-token-usage"
 )
 
 var globalStore = &store{}
 var globalQuotaTrigger = &quotaTriggerManager{}
+var globalModelPriceUpdater = &modelPriceUpdateManager{}
 
 type envelope struct {
 	OK     bool            `json:"ok"`
@@ -118,6 +119,10 @@ type pluginConfig struct {
 	QuotaTriggerMaxConcurrency            int
 	QuotaTriggerTimeoutSeconds            int
 	QuotaTriggerMinAccountCooldownMinutes int
+	ModelPriceAutoUpdateEnabled           bool
+	ModelPriceUpdateIntervalHours         int
+	ModelPriceUpdateURL                   string
+	ModelPriceUpdateTimeoutSeconds        int
 }
 
 type quotaTriggerState struct {
@@ -350,6 +355,10 @@ func pluginConfigFields() []configField {
 		{Name: "最大并发账号数", Type: "number", Description: "每轮最大并发触发账号数。默认 1。"},
 		{Name: "单账号超时秒数", Type: "number", Description: "单个账号触发请求超时时间，单位秒。默认 20。"},
 		{Name: "单账号最小冷却分钟", Type: "number", Description: "同一账号两次触发的最小冷却时间，单位分钟。默认 10。"},
+		{Name: "自动更新模型价格表", Type: "boolean", Description: "是否自动下载并更新 model_prices.json。默认开启。"},
+		{Name: "模型价格更新间隔小时", Type: "number", Description: "model_prices.json 自动检查间隔，单位小时。默认 6。"},
+		{Name: "模型价格表地址", Type: "string", Description: "模型价格 JSON 下载地址。默认使用 LiteLLM 官方价格表。"},
+		{Name: "模型价格更新超时秒数", Type: "number", Description: "下载 model_prices.json 的超时时间，单位秒。默认 20。"},
 	}
 }
 
@@ -415,6 +424,10 @@ func defaultPluginConfig() pluginConfig {
 		QuotaTriggerMaxConcurrency:            1,
 		QuotaTriggerTimeoutSeconds:            20,
 		QuotaTriggerMinAccountCooldownMinutes: 10,
+		ModelPriceAutoUpdateEnabled:           true,
+		ModelPriceUpdateIntervalHours:         6,
+		ModelPriceUpdateURL:                   defaultModelPriceURL,
+		ModelPriceUpdateTimeoutSeconds:        20,
 	}
 }
 
@@ -435,6 +448,7 @@ func configurePlugin(request []byte) error {
 	}
 	cfg = normalizePluginConfig(cfg)
 	globalQuotaTrigger.configure(cfg)
+	globalModelPriceUpdater.configure(cfg)
 	return nil
 }
 
@@ -476,6 +490,18 @@ func parsePluginConfigYAML(raw []byte, cfg pluginConfig) pluginConfig {
 	if value, ok := configValue(values, "quota_trigger_min_account_cooldown_minutes", "单账号最小冷却分钟"); ok {
 		cfg.QuotaTriggerMinAccountCooldownMinutes = parseInt(value, cfg.QuotaTriggerMinAccountCooldownMinutes, 1, 1440)
 	}
+	if value, ok := configValue(values, "model_price_auto_update_enabled", "自动更新模型价格表"); ok {
+		cfg.ModelPriceAutoUpdateEnabled = parseBoolString(value, cfg.ModelPriceAutoUpdateEnabled)
+	}
+	if value, ok := configValue(values, "model_price_update_interval_hours", "模型价格更新间隔小时"); ok {
+		cfg.ModelPriceUpdateIntervalHours = parseInt(value, cfg.ModelPriceUpdateIntervalHours, 1, 168)
+	}
+	if value, ok := configValue(values, "model_price_update_url", "模型价格表地址"); ok {
+		cfg.ModelPriceUpdateURL = value
+	}
+	if value, ok := configValue(values, "model_price_update_timeout_seconds", "模型价格更新超时秒数"); ok {
+		cfg.ModelPriceUpdateTimeoutSeconds = parseInt(value, cfg.ModelPriceUpdateTimeoutSeconds, 3, 300)
+	}
 	return cfg
 }
 
@@ -493,6 +519,11 @@ func normalizePluginConfig(cfg pluginConfig) pluginConfig {
 	cfg.QuotaTriggerMaxConcurrency = clampInt(cfg.QuotaTriggerMaxConcurrency, 1, 32)
 	cfg.QuotaTriggerTimeoutSeconds = clampInt(cfg.QuotaTriggerTimeoutSeconds, 3, 300)
 	cfg.QuotaTriggerMinAccountCooldownMinutes = clampInt(cfg.QuotaTriggerMinAccountCooldownMinutes, 1, 1440)
+	cfg.ModelPriceUpdateIntervalHours = clampInt(cfg.ModelPriceUpdateIntervalHours, 1, 168)
+	cfg.ModelPriceUpdateTimeoutSeconds = clampInt(cfg.ModelPriceUpdateTimeoutSeconds, 3, 300)
+	if strings.TrimSpace(cfg.ModelPriceUpdateURL) == "" {
+		cfg.ModelPriceUpdateURL = defaultModelPriceURL
+	}
 	mode := strings.ToLower(strings.TrimSpace(cfg.QuotaTriggerMode))
 	switch mode {
 	case "探测请求", "probe模式", "probe 模式":

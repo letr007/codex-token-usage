@@ -137,6 +137,7 @@ func (s *store) summary(ctx context.Context, window string, limit int) (map[stri
 		"external_use_alerts": externalUseAlerts,
 		"quota_trigger":       globalQuotaTrigger.status(),
 		"quota_trigger_runs":  triggerRuns,
+		"model_prices":        globalModelPriceUpdater.status(),
 	}, nil
 }
 

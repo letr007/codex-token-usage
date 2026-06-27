@@ -24,6 +24,8 @@ CPA 插件商店读取官方仓库 `router-for-me/CLIProxyAPI-Plugins-Store` 的
 
 如果某个平台 workflow 失败，可以先只保留成功的平台资产，但插件商店覆盖面会变小。
 
+完整模型价格表不会打入 release zip。插件运行时会按配置从 LiteLLM 兼容价格表 URL 自动更新 `/root/plugins/codex-token-usage/model_prices.json`。
+
 ## 2. 向官方插件商店提交 PR
 
 Fork `https://github.com/router-for-me/CLIProxyAPI-Plugins-Store`，在 `registry.json` 里新增：
