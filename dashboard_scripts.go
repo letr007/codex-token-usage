@@ -5,8 +5,14 @@ const resourceApi='/v0/resource/plugins/__PLUGIN_ID__/summary';
 const managementApi='/v0/management/plugins/__PLUGIN_ID__/summary';
 const resourceExportApi='/v0/resource/plugins/__PLUGIN_ID__/export';
 const managementExportApi='/v0/management/plugins/__PLUGIN_ID__/export';
+const managementAuthFilesApi='/v0/management/auth-files';
+const managementAuthFieldsApi='/v0/management/auth-files/fields';
 const keyEl=document.getElementById('key');
 const languageEl=document.getElementById('language');
+const batchProxyModal=document.getElementById('batch-proxy-modal');
+const batchProxyUrlEl=document.getElementById('batch-proxy-url');
+const batchProxyKeyEl=document.getElementById('batch-proxy-key');
+const batchProxyStatusEl=document.getElementById('batch-proxy-status');
 let lastData=null;
 let accountPage=1;
 let accountPageSize=25;
@@ -18,6 +24,7 @@ let loading=false;
 const saved=sessionStorage.getItem('cpa_token_usage_key'); if(saved) keyEl.value=saved;
 selectedProviders=loadSelectedProviders();
 initLanguageControl();
+initBatchProxyControl();
 initUIPreferences();
 applyHostTheme();
 observeHostTheme();
@@ -90,6 +97,95 @@ function initLanguageControl(){
     localStorage.setItem(languageStorageKey(),languageEl.value||'zh');
     refreshLanguage(true);
   };
+}
+function initBatchProxyControl(){
+  document.getElementById('batch-proxy-open').onclick=openBatchProxyModal;
+  document.getElementById('batch-proxy-close').onclick=closeBatchProxyModal;
+  document.getElementById('batch-proxy-preview').onclick=previewBatchProxyTargets;
+  document.getElementById('batch-proxy-apply').onclick=applyBatchProxy;
+  batchProxyModal.addEventListener('click',e=>{if(e.target===batchProxyModal)closeBatchProxyModal()});
+  document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!batchProxyModal.hidden)closeBatchProxyModal()});
+  batchProxyKeyEl.addEventListener('input',()=>syncBatchProxyKey(false));
+}
+function openBatchProxyModal(){
+  batchProxyKeyEl.value=keyEl.value.trim()||sessionStorage.getItem('cpa_token_usage_key')||'';
+  setBatchProxyStatus('等待输入代理地址。','');
+  batchProxyModal.hidden=false;
+  setTimeout(()=>batchProxyUrlEl.focus(),0);
+}
+function closeBatchProxyModal(){batchProxyModal.hidden=true}
+function syncBatchProxyKey(save=true){
+  const key=batchProxyKeyEl.value.trim();
+  keyEl.value=key;
+  if(save&&key)sessionStorage.setItem('cpa_token_usage_key',key);
+}
+function batchProxyKey(){
+  const key=(batchProxyKeyEl.value||keyEl.value||'').trim();
+  if(key){keyEl.value=key;sessionStorage.setItem('cpa_token_usage_key',key)}
+  return key;
+}
+function setBatchProxyStatus(text,tone){
+  batchProxyStatusEl.textContent=tr(text);
+  batchProxyStatusEl.classList.remove('ok','warn','bad');
+  if(tone)batchProxyStatusEl.classList.add(tone);
+}
+function codexAuthFiles(files){
+  return (files||[]).filter(f=>{
+    if(f.runtime_only)return false;
+    const provider=String(f.provider||f.type||'').trim().toLowerCase();
+    return provider==='codex' || provider.includes('codex');
+  });
+}
+async function fetchAuthFilesForBatch(key){
+  if(!key)throw new Error('请填写 CPA 管理密钥。');
+  const res=await fetch(managementAuthFilesApi,{headers:{Authorization:'Bearer '+key,Accept:'application/json'}});
+  if(!res.ok){
+    const body=await res.text();
+    if(res.status===401){sessionStorage.removeItem('cpa_token_usage_key');keyEl.value='';batchProxyKeyEl.value=''}
+    throw new Error('HTTP '+res.status+' '+body);
+  }
+  const data=await res.json();
+  return codexAuthFiles(data.files||[]);
+}
+async function previewBatchProxyTargets(){
+  const key=batchProxyKey();
+  setBatchProxyStatus('正在读取 Codex 认证文件...','');
+  try{
+    const files=await fetchAuthFilesForBatch(key);
+    setBatchProxyStatus(files.length?('将写入 '+files.length+' 个 Codex 认证文件。'):'没有找到可写入的 Codex 认证文件。',files.length?'ok':'warn');
+  }catch(e){
+    setBatchProxyStatus('预览失败：'+e.message,'bad');
+  }
+}
+async function applyBatchProxy(){
+  const proxy=(batchProxyUrlEl.value||'').trim();
+  const key=batchProxyKey();
+  if(!proxy){setBatchProxyStatus('请先填写代理地址。','warn');return}
+  const applyBtn=document.getElementById('batch-proxy-apply');
+  const previewBtn=document.getElementById('batch-proxy-preview');
+  applyBtn.disabled=true; previewBtn.disabled=true;
+  try{
+    setBatchProxyStatus('正在读取 Codex 认证文件...','');
+    const files=await fetchAuthFilesForBatch(key);
+    if(!files.length){setBatchProxyStatus('没有找到可写入的 Codex 认证文件。','warn');return}
+    let ok=0,failed=0;
+    for(const file of files){
+      const name=String(file.name||file.id||'').trim();
+      if(!name){failed++;continue}
+      const res=await fetch(managementAuthFieldsApi,{
+        method:'PATCH',
+        headers:{Authorization:'Bearer '+key,'Content-Type':'application/json',Accept:'application/json'},
+        body:JSON.stringify({name:name,proxy_url:proxy})
+      });
+      if(res.ok){ok++}else{failed++}
+      setBatchProxyStatus('正在写入：成功 '+ok+' / 失败 '+failed+' / 总计 '+files.length,'');
+    }
+    setBatchProxyStatus('批量写入完成：成功 '+ok+' 个，失败 '+failed+' 个。',failed?'warn':'ok');
+  }catch(e){
+    setBatchProxyStatus('批量写入失败：'+e.message,'bad');
+  }finally{
+    applyBtn.disabled=false; previewBtn.disabled=false;
+  }
 }
 function syncLanguageControl(){if(languageEl)languageEl.value=languageMode()}
 function switchPage(page){
@@ -200,6 +296,32 @@ const i18nEn={
   '按账号聚合 CPA usage：Token 消耗、缓存率、请求健康、5h/7d 额度窗口和最近异常。':'Aggregate CPA usage by account: tokens, cache rate, request health, 5h/7d quota windows, and recent anomalies.',
   '语言':'Language',
   '中文':'Chinese',
+  '批量写入代理':'Batch proxy',
+  '批量写入 Codex 代理':'Batch write Codex proxy',
+  '关闭批量写入代理':'Close batch proxy writer',
+  '代理地址':'Proxy URL',
+  '管理密钥':'Management key',
+  'CPA 管理密钥':'CPA management key',
+  '只写入 Codex 认证文件的 ':'Only writes the ',
+  ' 字段。填写 ':' field of Codex auth files. Enter ',
+  ' 可批量直连，留空不会执行。':' for direct connections; blank input will not run.',
+  '等待输入代理地址。':'Waiting for a proxy URL.',
+  '预览数量':'Preview count',
+  '应用':'Apply',
+  '请填写 CPA 管理密钥。':'Enter the CPA management key.',
+  '正在读取 Codex 认证文件...':'Reading Codex auth files...',
+  '将写入 ':'Will write ',
+  ' 个 Codex 认证文件。':' Codex auth files.',
+  '没有找到可写入的 Codex 认证文件。':'No writable Codex auth files found.',
+  '预览失败：':'Preview failed: ',
+  '请先填写代理地址。':'Enter the proxy URL first.',
+  '正在写入：成功 ':'Writing: success ',
+  ' / 失败 ':' / failed ',
+  ' / 总计 ':' / total ',
+  '批量写入完成：成功 ':'Batch write complete: success ',
+  ' 个，失败 ':' files, failed ',
+  ' 个。':' files.',
+  '批量写入失败：':'Batch write failed: ',
   '管理密钥备用输入':'Fallback management key',
   'CPA 管理密码备用输入':'Fallback CPA management key',
   '统计窗口':'Time window',
@@ -414,7 +536,10 @@ function tr(text){
     ['耗时 ','latency '],['首包 ','TTFT '],['慢请求 ','slow req '],['慢首包 ','slow TTFT '],
     ['失败 ','failed '],['次',' times'],['天','d'],['小时','h'],['分','m'],['窗口：','Window: '],
     ['数据库：','DB: '],['更新时间：','Updated: '],['自动获取失败，请填写备用 CPA 管理密钥后刷新。','Auto loading failed. Enter the fallback CPA management key and refresh.'],
-    ['备用管理密钥不正确，已清除临时保存值。','Fallback management key is incorrect. The temporary value was cleared.']
+    ['备用管理密钥不正确，已清除临时保存值。','Fallback management key is incorrect. The temporary value was cleared.'],
+    ['将写入 ','Will write '],[' 个 Codex 认证文件。',' Codex auth files.'],['预览失败：','Preview failed: '],
+    ['批量写入失败：','Batch write failed: '],['正在写入：成功 ','Writing: success '],[' / 失败 ',' / failed '],
+    [' / 总计 ',' / total '],['批量写入完成：成功 ','Batch write complete: success '],[' 个，失败 ',' files, failed '],[' 个。',' files.']
   ].forEach(pair=>exact(pair[0],pair[1]));
   return out;
 }

@@ -8,6 +8,7 @@ const dashboardBody = `</style>
     <div><h1>CPA Token Usage</h1><div class="hint">按账号聚合 CPA usage：Token 消耗、缓存率、请求健康、5h/7d 额度窗口和最近异常。</div></div>
     <div class="controls">
       <input id="key" class="fallback-key" type="password" autocomplete="current-password" aria-label="CPA 管理密码备用输入" placeholder="管理密钥备用输入">
+      <button id="batch-proxy-open" class="ghost" type="button">批量写入代理</button>
       <select id="language" aria-label="语言"><option value="zh">中文</option><option value="en">English</option></select>
       <select id="window" aria-label="统计窗口"><option value="24h">最近 24 小时</option><option value="today">今天</option><option value="7d">最近 7 天</option><option value="30d">最近 30 天</option><option value="all">全部</option></select>
       <button id="export-csv" class="ghost">导出账号 CSV</button>
@@ -85,5 +86,20 @@ const dashboardBody = `</style>
   </section>
   <div id="provider-pages"></div>
 </main>
+<div id="batch-proxy-modal" class="modal-backdrop" hidden>
+  <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="batch-proxy-title">
+    <div class="modal-head"><h2 id="batch-proxy-title">批量写入 Codex 代理</h2><button id="batch-proxy-close" class="icon-button ghost" type="button" aria-label="关闭批量写入代理">×</button></div>
+    <div class="modal-body">
+      <label class="form-row"><span>代理地址</span><input id="batch-proxy-url" autocomplete="off" placeholder="socks5://username:password@proxy_ip:port/"></label>
+      <label class="form-row"><span>管理密钥</span><input id="batch-proxy-key" type="password" autocomplete="current-password" placeholder="CPA 管理密钥"></label>
+      <div class="modal-note">只写入 Codex 认证文件的 <code>proxy_url</code> 字段。填写 <code>direct</code> 可批量直连，留空不会执行。</div>
+      <div id="batch-proxy-status" class="modal-status" role="status" aria-live="polite">等待输入代理地址。</div>
+    </div>
+    <div class="modal-actions">
+      <button id="batch-proxy-preview" class="ghost" type="button">预览数量</button>
+      <button id="batch-proxy-apply" type="button">应用</button>
+    </div>
+  </div>
+</div>
 <script>
 `

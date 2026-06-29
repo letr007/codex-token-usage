@@ -55,6 +55,7 @@ func (s *store) summary(ctx context.Context, window string, limit int) (map[stri
 	}
 	configuredAccounts := readConfiguredAuthAccounts()
 	accounts = mergeConfiguredAccounts(accounts, configuredAccounts)
+	accounts = filterCurrentConfiguredAccounts(accounts, configuredAccounts, configuredAuthDirectoryReadable())
 	quotaSince := time.Now().Add(-35 * 24 * time.Hour).Unix()
 	applyLatestQuotaSnapshots(ctx, db, accounts, quotaSince)
 	applySecondaryQuotaEstimates(ctx, db, accounts, &totals, quotaSince)
@@ -939,6 +940,15 @@ func fileNameIfJSON(value string) string {
 	return ""
 }
 
+func configuredAuthDirectoryReadable() bool {
+	authDir := configuredAuthDir()
+	if authDir == "" {
+		return false
+	}
+	_, err := os.ReadDir(authDir)
+	return err == nil
+}
+
 func yamlScalar(raw string, keys ...string) string {
 	lines := strings.Split(raw, "\n")
 	for _, line := range lines {
@@ -1027,6 +1037,37 @@ func mergeConfiguredAccounts(accounts []accountRow, configured []configuredAccou
 		}
 	}
 	return merged
+}
+
+func filterCurrentConfiguredAccounts(accounts []accountRow, configured []configuredAccount, authDirReadable bool) []accountRow {
+	if !authDirReadable || len(configured) == 0 {
+		return accounts
+	}
+	aliases := make(map[string]struct{}, len(configured)*6)
+	for _, cfg := range configured {
+		for _, alias := range configuredAliases(cfg) {
+			if alias != "" {
+				aliases[alias] = struct{}{}
+			}
+		}
+	}
+	if len(aliases) == 0 {
+		return nil
+	}
+	out := accounts[:0]
+	for _, account := range accounts {
+		keep := false
+		for _, alias := range accountAliases(account) {
+			if _, ok := aliases[alias]; ok {
+				keep = true
+				break
+			}
+		}
+		if keep {
+			out = append(out, account)
+		}
+	}
+	return out
 }
 
 func enrichConfiguredAccount(row *accountRow, cfg configuredAccount) {

@@ -269,6 +269,64 @@ func TestCodex401InvalidAuthFiltersUntilAuthFileReplaced(t *testing.T) {
 	}
 }
 
+func TestSummaryHidesDeletedConfiguredCodexAccounts(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	authDir := t.TempDir()
+	t.Setenv("CPA_AUTH_DIR", authDir)
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+
+	activeAuth := filepath.Join(authDir, "active.cpa.json")
+	if err := os.WriteFile(activeAuth, []byte(`{"email":"active@example.com","type":"codex","access_token":"active-token"}`), 0600); err != nil {
+		t.Fatalf("write active auth: %v", err)
+	}
+	if err := store.recordUsage(ctx, usageRecord{
+		Provider:    "codex",
+		AuthID:      "active@example.com",
+		AuthIndex:   "active@example.com",
+		Source:      "active@example.com",
+		RequestedAt: time.Now(),
+		Detail: usageDetail{
+			InputTokens:  10,
+			OutputTokens: 5,
+		},
+	}); err != nil {
+		t.Fatalf("recordUsage active returned error: %v", err)
+	}
+	if err := store.recordUsage(ctx, usageRecord{
+		Provider:    "codex",
+		AuthID:      "deleted@example.com",
+		AuthIndex:   "deleted@example.com",
+		Source:      "deleted@example.com",
+		RequestedAt: time.Now(),
+		Failed:      true,
+		Failure:     usageFailure{StatusCode: http.StatusUnauthorized},
+		Detail: usageDetail{
+			InputTokens:  10,
+			OutputTokens: 5,
+		},
+	}); err != nil {
+		t.Fatalf("recordUsage deleted returned error: %v", err)
+	}
+
+	data, err := store.summary(ctx, "24h", 10)
+	if err != nil {
+		t.Fatalf("summary returned error: %v", err)
+	}
+	accounts := data["accounts"].([]accountRow)
+	if len(accounts) != 1 {
+		t.Fatalf("accounts len = %d, want only current auth account: %#v", len(accounts), accounts)
+	}
+	if accounts[0].Email != "active@example.com" || !accounts[0].Configured {
+		t.Fatalf("account = %#v, want configured active@example.com", accounts[0])
+	}
+	invalids := data["invalid_auths"].([]invalidAuthRow)
+	if len(invalids) != 1 || invalids[0].AuthID != "deleted@example.com" {
+		t.Fatalf("invalid_auths = %#v, want deleted auth retained for diagnostics", invalids)
+	}
+}
+
 func TestSchedulerKeepsHostFillFirstWhenNoFilteringNeeded(t *testing.T) {
 	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
 	store := &store{}

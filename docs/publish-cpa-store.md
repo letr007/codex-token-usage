@@ -8,18 +8,18 @@ CPA 插件商店读取官方仓库 `router-for-me/CLIProxyAPI-Plugins-Store` 的
 2. 创建版本标签，例如：
 
    ```bash
-   git tag v0.1.9
-   git push origin v0.1.9
+   git tag v0.1.10
+   git push origin v0.1.10
    ```
 
 3. GitHub Actions 会生成 release 资产：
 
    ```text
-   codex-token-usage_0.1.9_linux_amd64.zip
-   codex-token-usage_0.1.9_linux_arm64.zip
-   codex-token-usage_0.1.9_darwin_amd64.zip
-   codex-token-usage_0.1.9_darwin_arm64.zip
-   codex-token-usage_0.1.9_windows_amd64.zip
+   codex-token-usage_0.1.10_linux_amd64.zip
+   codex-token-usage_0.1.10_linux_arm64.zip
+   codex-token-usage_0.1.10_darwin_amd64.zip
+   codex-token-usage_0.1.10_darwin_arm64.zip
+   codex-token-usage_0.1.10_windows_amd64.zip
    checksums.txt
    ```
 
@@ -49,6 +49,6 @@ Fork `https://github.com/router-for-me/CLIProxyAPI-Plugins-Store`，在 `registr
 ## 3. 发布新版本
 
 1. 修改 `pluginVersion`。
-2. 创建新 tag，例如 `v0.1.9`。
+2. 创建新 tag，例如 `v0.1.10`。
 3. 等 Release 资产生成。
 4. 通常不需要更新插件商店 `registry.json`；CPA 会读取仓库 latest release。`version` 只是 latest release 查询失败时的旧版显示 fallback。
