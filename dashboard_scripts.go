@@ -10,6 +10,8 @@ const languageEl=document.getElementById('language');
 const batchProxyModal=document.getElementById('batch-proxy-modal');
 const batchProxyUrlEl=document.getElementById('batch-proxy-url');
 const batchProxyStatusEl=document.getElementById('batch-proxy-status');
+const cpaStoragePrefix='enc::v1::';
+const cpaSecureStorageSalt='cli-proxy-api-webui::secure-storage';
 let lastData=null;
 let accountPage=1;
 let accountPageSize=25;
@@ -18,7 +20,7 @@ let selectedProviders=[];
 let providerSelectionSaved=false;
 let currentLang=effectiveLanguage();
 let loading=false;
-const saved=sessionStorage.getItem('cpa_token_usage_key'); if(saved) keyEl.value=saved;
+const saved=managementKey(); if(saved) keyEl.value=saved;
 selectedProviders=loadSelectedProviders();
 initLanguageControl();
 initBatchProxyControl();
@@ -68,11 +70,15 @@ function applyAccountColumns(){
 function exportType(){return 'accounts'}
 async function downloadExport(format){
   const params='?window='+encodeURIComponent(document.getElementById('window').value)+'&limit=5000&type='+encodeURIComponent(exportType())+'&format='+encodeURIComponent(format);
-  const key=keyEl.value.trim();
-  if(!key){keyEl.classList.add('on');keyEl.focus();document.getElementById('status').textContent=tr('请填写备用 CPA 管理密钥后导出。');return}
+  const key=managementKey();
+  if(!key){showFallbackKeyInput();document.getElementById('status').textContent=tr('请填写备用 CPA 管理密钥后导出。');return}
   sessionStorage.setItem('cpa_token_usage_key',key);
   const res=await fetch(managementExportApi+params,{headers:{Authorization:'Bearer '+key}});
-  if(!res.ok){document.getElementById('status').textContent=tr('导出失败：')+res.status;return}
+  if(!res.ok){
+    if(res.status===401)rejectManagementKey(key);
+    document.getElementById('status').textContent=tr('导出失败：')+res.status;
+    return;
+  }
   const blob=await res.blob();
   const url=URL.createObjectURL(blob);
   const a=document.createElement('a');
@@ -111,14 +117,78 @@ function openBatchProxyModal(){
 }
 function closeBatchProxyModal(){batchProxyModal.hidden=true}
 function batchProxyKey(){
-  const key=(keyEl.value||sessionStorage.getItem('cpa_token_usage_key')||'').trim();
+  const key=managementKey();
   if(key){keyEl.value=key;sessionStorage.setItem('cpa_token_usage_key',key)}
   return key;
 }
-function missingBatchProxyKey(){
+function showFallbackKeyInput(){
   keyEl.classList.add('on');
   keyEl.focus();
+}
+function missingBatchProxyKey(){
+  showFallbackKeyInput();
   setBatchProxyStatus('请在页面顶部填写 CPA 管理密钥后重试。','warn');
+}
+function managementKey(){
+  const typed=firstText(keyEl.value);
+  const rejected=sessionStorage.getItem('cpa_token_usage_rejected_key')||'';
+  let key=typed;
+  if(!key){
+    for(const candidate of [cpaStoredManagementKey(),sessionStorage.getItem('cpa_token_usage_key')]){
+      const value=firstText(candidate);
+      if(value&&value!==rejected){key=value;break}
+    }
+  }
+  if(key){
+    keyEl.value=key;
+    sessionStorage.setItem('cpa_token_usage_key',key);
+    sessionStorage.removeItem('cpa_token_usage_rejected_key');
+    keyEl.classList.remove('on');
+  }
+  return key;
+}
+function rejectManagementKey(key){
+  if(key)sessionStorage.setItem('cpa_token_usage_rejected_key',key);
+  sessionStorage.removeItem('cpa_token_usage_key');
+  keyEl.value='';
+  showFallbackKeyInput();
+}
+function cpaStoredManagementKey(){
+  return firstText(
+    readCPAStorageValue(sessionStorage,'managementKey'),
+    readCPAStorageValue(localStorage,'managementKey'),
+    readCPAAuthStoreKey(sessionStorage),
+    readCPAAuthStoreKey(localStorage)
+  );
+}
+function readCPAAuthStoreKey(storage){
+  const auth=readCPAStorageValue(storage,'cli-proxy-auth');
+  if(!auth||typeof auth!=='object')return '';
+  return firstText(auth.state&&auth.state.managementKey,auth.managementKey);
+}
+function readCPAStorageValue(storage,name){
+  if(!storage)return null;
+  const raw=readStorageText(storage,name);
+  if(!raw)return null;
+  const decoded=decodeCPAStorage(raw);
+  return parseStoredValue(decoded||raw);
+}
+function readStorageText(storage,name){
+  try{return String(storage.getItem(name)||'').trim()}catch(e){return ''}
+}
+function parseStoredValue(value){
+  if(!value)return null;
+  try{return JSON.parse(value)}catch(e){return value}
+}
+function decodeCPAStorage(value){
+  if(!value||!value.startsWith(cpaStoragePrefix))return value;
+  try{
+    const data=Uint8Array.from(atob(value.slice(cpaStoragePrefix.length)),c=>c.charCodeAt(0));
+    const key=new TextEncoder().encode(cpaSecureStorageSalt+'|'+window.location.host+'|'+navigator.userAgent);
+    const out=new Uint8Array(data.length);
+    for(let i=0;i<data.length;i++)out[i]=data[i]^key[i%key.length];
+    return new TextDecoder().decode(out);
+  }catch(e){return ''}
 }
 function setBatchProxyStatus(text,tone){
   batchProxyStatusEl.textContent=tr(text);
@@ -137,7 +207,7 @@ async function fetchAuthFilesForBatch(key){
   const res=await fetch(managementAuthFilesApi,{headers:{Authorization:'Bearer '+key,Accept:'application/json'}});
   if(!res.ok){
     const body=await res.text();
-    if(res.status===401){sessionStorage.removeItem('cpa_token_usage_key');keyEl.value='';keyEl.classList.add('on')}
+    if(res.status===401)rejectManagementKey(key);
     throw new Error('HTTP '+res.status+' '+body);
   }
   const data=await res.json();
@@ -677,7 +747,7 @@ function requestStatusText(r){const code=Number(r.status_code||0)||((r.failed||f
 async function load(){
   if(loading)return;
   loading=true;
-  const key=keyEl.value.trim(); if(key)sessionStorage.setItem('cpa_token_usage_key',key);
+  const key=managementKey(); if(key)sessionStorage.setItem('cpa_token_usage_key',key);
   const win=document.getElementById('window').value;
   const st=document.getElementById('status'); st.textContent=tr('加载中...');
   try{
@@ -689,12 +759,12 @@ async function load(){
 }
 async function fetchSummary(win,key){
   const url='?window='+encodeURIComponent(win)+'&limit=2000';
-  keyEl.classList.add('on');
-  if(!key)throw new Error('请填写备用 CPA 管理密钥后刷新。');
+  if(!key){showFallbackKeyInput();throw new Error('请填写备用 CPA 管理密钥后刷新。')}
+  keyEl.classList.remove('on');
   const res=await fetch(managementApi+url,{headers:{Authorization:'Bearer '+key,Accept:'application/json'}});
   if(!res.ok){
     const body=await res.text();
-    if(res.status===401){sessionStorage.removeItem('cpa_token_usage_key'); keyEl.value='';}
+    if(res.status===401)rejectManagementKey(key);
     throw new Error('HTTP '+res.status+' '+body+(res.status===401?' | '+tr('备用管理密钥不正确，已清除临时保存值。'):''));
   }
   const data=await res.json(); data._source='management'; return data;
