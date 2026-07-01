@@ -1,9 +1,7 @@
 package main
 
 const dashboardScripts = `
-const resourceApi='/v0/resource/plugins/__PLUGIN_ID__/summary';
 const managementApi='/v0/management/plugins/__PLUGIN_ID__/summary';
-const resourceExportApi='/v0/resource/plugins/__PLUGIN_ID__/export';
 const managementExportApi='/v0/management/plugins/__PLUGIN_ID__/export';
 const managementAuthFilesApi='/v0/management/auth-files';
 const managementAuthFieldsApi='/v0/management/auth-files/fields';
@@ -11,7 +9,6 @@ const keyEl=document.getElementById('key');
 const languageEl=document.getElementById('language');
 const batchProxyModal=document.getElementById('batch-proxy-modal');
 const batchProxyUrlEl=document.getElementById('batch-proxy-url');
-const batchProxyKeyEl=document.getElementById('batch-proxy-key');
 const batchProxyStatusEl=document.getElementById('batch-proxy-status');
 let lastData=null;
 let accountPage=1;
@@ -72,9 +69,9 @@ function exportType(){return 'accounts'}
 async function downloadExport(format){
   const params='?window='+encodeURIComponent(document.getElementById('window').value)+'&limit=5000&type='+encodeURIComponent(exportType())+'&format='+encodeURIComponent(format);
   const key=keyEl.value.trim();
-  const api=key?managementExportApi:resourceExportApi;
-  const headers=key?{'Authorization':'Bearer '+key}:{};
-  const res=await fetch(api+params,{headers});
+  if(!key){keyEl.classList.add('on');keyEl.focus();document.getElementById('status').textContent=tr('请填写备用 CPA 管理密钥后导出。');return}
+  sessionStorage.setItem('cpa_token_usage_key',key);
+  const res=await fetch(managementExportApi+params,{headers:{Authorization:'Bearer '+key}});
   if(!res.ok){document.getElementById('status').textContent=tr('导出失败：')+res.status;return}
   const blob=await res.blob();
   const url=URL.createObjectURL(blob);
@@ -101,28 +98,27 @@ function initLanguageControl(){
 function initBatchProxyControl(){
   document.getElementById('batch-proxy-open').onclick=openBatchProxyModal;
   document.getElementById('batch-proxy-close').onclick=closeBatchProxyModal;
+  document.getElementById('batch-proxy-clear').onclick=clearBatchProxy;
   document.getElementById('batch-proxy-preview').onclick=previewBatchProxyTargets;
   document.getElementById('batch-proxy-apply').onclick=applyBatchProxy;
   batchProxyModal.addEventListener('click',e=>{if(e.target===batchProxyModal)closeBatchProxyModal()});
   document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!batchProxyModal.hidden)closeBatchProxyModal()});
-  batchProxyKeyEl.addEventListener('input',()=>syncBatchProxyKey(false));
 }
 function openBatchProxyModal(){
-  batchProxyKeyEl.value=keyEl.value.trim()||sessionStorage.getItem('cpa_token_usage_key')||'';
   setBatchProxyStatus('等待输入代理地址。','');
   batchProxyModal.hidden=false;
   setTimeout(()=>batchProxyUrlEl.focus(),0);
 }
 function closeBatchProxyModal(){batchProxyModal.hidden=true}
-function syncBatchProxyKey(save=true){
-  const key=batchProxyKeyEl.value.trim();
-  keyEl.value=key;
-  if(save&&key)sessionStorage.setItem('cpa_token_usage_key',key);
-}
 function batchProxyKey(){
-  const key=(batchProxyKeyEl.value||keyEl.value||'').trim();
+  const key=(keyEl.value||sessionStorage.getItem('cpa_token_usage_key')||'').trim();
   if(key){keyEl.value=key;sessionStorage.setItem('cpa_token_usage_key',key)}
   return key;
+}
+function missingBatchProxyKey(){
+  keyEl.classList.add('on');
+  keyEl.focus();
+  setBatchProxyStatus('请在页面顶部填写 CPA 管理密钥后重试。','warn');
 }
 function setBatchProxyStatus(text,tone){
   batchProxyStatusEl.textContent=tr(text);
@@ -141,7 +137,7 @@ async function fetchAuthFilesForBatch(key){
   const res=await fetch(managementAuthFilesApi,{headers:{Authorization:'Bearer '+key,Accept:'application/json'}});
   if(!res.ok){
     const body=await res.text();
-    if(res.status===401){sessionStorage.removeItem('cpa_token_usage_key');keyEl.value='';batchProxyKeyEl.value=''}
+    if(res.status===401){sessionStorage.removeItem('cpa_token_usage_key');keyEl.value='';keyEl.classList.add('on')}
     throw new Error('HTTP '+res.status+' '+body);
   }
   const data=await res.json();
@@ -149,6 +145,7 @@ async function fetchAuthFilesForBatch(key){
 }
 async function previewBatchProxyTargets(){
   const key=batchProxyKey();
+  if(!key){missingBatchProxyKey();return}
   setBatchProxyStatus('正在读取 Codex 认证文件...','');
   try{
     const files=await fetchAuthFilesForBatch(key);
@@ -160,10 +157,21 @@ async function previewBatchProxyTargets(){
 async function applyBatchProxy(){
   const proxy=(batchProxyUrlEl.value||'').trim();
   const key=batchProxyKey();
+  if(!key){missingBatchProxyKey();return}
   if(!proxy){setBatchProxyStatus('请先填写代理地址。','warn');return}
+  await writeBatchProxy(proxy,'批量写入完成：成功 ','批量写入失败：','正在写入：成功 ');
+}
+async function clearBatchProxy(){
+  const key=batchProxyKey();
+  if(!key){missingBatchProxyKey();return}
+  await writeBatchProxy('','清除完成：成功 ','清除失败：','正在清除：成功 ');
+}
+async function writeBatchProxy(proxy,donePrefix,failPrefix,progressPrefix){
+  const key=batchProxyKey();
   const applyBtn=document.getElementById('batch-proxy-apply');
   const previewBtn=document.getElementById('batch-proxy-preview');
-  applyBtn.disabled=true; previewBtn.disabled=true;
+  const clearBtn=document.getElementById('batch-proxy-clear');
+  applyBtn.disabled=true; previewBtn.disabled=true; clearBtn.disabled=true;
   try{
     setBatchProxyStatus('正在读取 Codex 认证文件...','');
     const files=await fetchAuthFilesForBatch(key);
@@ -178,13 +186,13 @@ async function applyBatchProxy(){
         body:JSON.stringify({name:name,proxy_url:proxy})
       });
       if(res.ok){ok++}else{failed++}
-      setBatchProxyStatus('正在写入：成功 '+ok+' / 失败 '+failed+' / 总计 '+files.length,'');
+      setBatchProxyStatus(progressPrefix+ok+' / 失败 '+failed+' / 总计 '+files.length,'');
     }
-    setBatchProxyStatus('批量写入完成：成功 '+ok+' 个，失败 '+failed+' 个。',failed?'warn':'ok');
+    setBatchProxyStatus(donePrefix+ok+' 个，失败 '+failed+' 个。',failed?'warn':'ok');
   }catch(e){
-    setBatchProxyStatus('批量写入失败：'+e.message,'bad');
+    setBatchProxyStatus(failPrefix+e.message,'bad');
   }finally{
-    applyBtn.disabled=false; previewBtn.disabled=false;
+    applyBtn.disabled=false; previewBtn.disabled=false; clearBtn.disabled=false;
   }
 }
 function syncLanguageControl(){if(languageEl)languageEl.value=languageMode()}
@@ -306,9 +314,11 @@ const i18nEn={
   ' 字段。填写 ':' field of Codex auth files. Enter ',
   ' 可批量直连，留空不会执行。':' for direct connections; blank input will not run.',
   '等待输入代理地址。':'Waiting for a proxy URL.',
+  '清除所有代理':'Clear all proxies',
   '预览数量':'Preview count',
   '应用':'Apply',
   '请填写 CPA 管理密钥。':'Enter the CPA management key.',
+  '请在页面顶部填写 CPA 管理密钥后重试。':'Enter the CPA management key at the top of the page, then retry.',
   '正在读取 Codex 认证文件...':'Reading Codex auth files...',
   '将写入 ':'Will write ',
   ' 个 Codex 认证文件。':' Codex auth files.',
@@ -316,12 +326,15 @@ const i18nEn={
   '预览失败：':'Preview failed: ',
   '请先填写代理地址。':'Enter the proxy URL first.',
   '正在写入：成功 ':'Writing: success ',
+  '正在清除：成功 ':'Clearing: success ',
   ' / 失败 ':' / failed ',
   ' / 总计 ':' / total ',
   '批量写入完成：成功 ':'Batch write complete: success ',
+  '清除完成：成功 ':'Clear complete: success ',
   ' 个，失败 ':' files, failed ',
   ' 个。':' files.',
   '批量写入失败：':'Batch write failed: ',
+  '清除失败：':'Clear failed: ',
   '管理密钥备用输入':'Fallback management key',
   'CPA 管理密码备用输入':'Fallback CPA management key',
   '统计窗口':'Time window',
@@ -457,11 +470,11 @@ const i18nEn={
   '暂无 Provider 数据':'No provider data',
   '暂无请求记录':'No request records',
   '导出失败：':'Export failed: ',
-  '已清除备用管理密钥；页面会继续优先使用插件资源接口自动加载。':'Cleared fallback management key. The page will keep trying the plugin resource API first.',
-  '自动获取失败，请填写备用 CPA 管理密钥后刷新。':'Auto loading failed. Enter the fallback CPA management key and refresh.',
+  '已清除备用管理密钥；页面需要 CPA 管理密钥加载统计。':'Cleared fallback management key. The page needs the CPA management key to load usage data.',
+  '请填写备用 CPA 管理密钥后刷新。':'Enter the fallback CPA management key and refresh.',
+  '请填写备用 CPA 管理密钥后导出。':'Enter the fallback CPA management key before exporting.',
   '备用管理密钥不正确，已清除临时保存值。':'Fallback management key is incorrect. The temporary value was cleared.',
-  '已自动获取':'Loaded automatically',
-  '备用密钥':'Fallback key',
+  '管理接口':'Management API',
   '加载中...':'Loading...',
   '失败':'Failed',
   '优先':'Priority',
@@ -535,7 +548,7 @@ function tr(text){
     ['缓存 ↓ ','cache ↓ '],['推理 ','reasoning '],['余 ','remaining '],['总 ','total '],['已用 ','used '],
     ['耗时 ','latency '],['首包 ','TTFT '],['慢请求 ','slow req '],['慢首包 ','slow TTFT '],
     ['失败 ','failed '],['次',' times'],['天','d'],['小时','h'],['分','m'],['窗口：','Window: '],
-    ['数据库：','DB: '],['更新时间：','Updated: '],['自动获取失败，请填写备用 CPA 管理密钥后刷新。','Auto loading failed. Enter the fallback CPA management key and refresh.'],
+    ['数据库：','DB: '],['更新时间：','Updated: '],['请填写备用 CPA 管理密钥后刷新。','Enter the fallback CPA management key and refresh.'],
     ['备用管理密钥不正确，已清除临时保存值。','Fallback management key is incorrect. The temporary value was cleared.'],
     ['将写入 ','Will write '],[' 个 Codex 认证文件。',' Codex auth files.'],['预览失败：','Preview failed: '],
     ['批量写入失败：','Batch write failed: '],['正在写入：成功 ','Writing: success '],[' / 失败 ',' / failed '],
@@ -670,21 +683,14 @@ async function load(){
   try{
     lastData=await fetchSummary(win,key);
     renderAll();
-    st.textContent=tr('窗口：')+lastData.window+' · '+tr('数据库：')+lastData.db_path+' · '+tr('更新时间：')+lastData.generated_at+' · '+tr(lastData._source==='resource'?'已自动获取':'备用密钥');
+    st.textContent=tr('窗口：')+lastData.window+' · '+tr('数据库：')+lastData.db_path+' · '+tr('更新时间：')+lastData.generated_at+' · '+tr('管理接口');
   }catch(e){st.textContent=tr('失败')+': '+tr(e.message)}
   finally{loading=false}
 }
 async function fetchSummary(win,key){
   const url='?window='+encodeURIComponent(win)+'&limit=2000';
-  try{
-    const res=await fetch(resourceApi+url,{headers:{Accept:'application/json'}});
-    if(res.ok){
-      keyEl.classList.remove('on');
-      const data=await res.json(); data._source='resource'; return data;
-    }
-  }catch(e){}
   keyEl.classList.add('on');
-  if(!key)throw new Error('自动获取失败，请填写备用 CPA 管理密钥后刷新。');
+  if(!key)throw new Error('请填写备用 CPA 管理密钥后刷新。');
   const res=await fetch(managementApi+url,{headers:{Authorization:'Bearer '+key,Accept:'application/json'}});
   if(!res.ok){
     const body=await res.text();

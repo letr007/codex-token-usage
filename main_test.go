@@ -16,6 +16,46 @@ import (
 	"time"
 )
 
+func TestResourceRoutesExposeOnlyStaticDashboard(t *testing.T) {
+	raw, err := handleMethod("management.register", nil)
+	if err != nil {
+		t.Fatalf("management.register returned error: %v", err)
+	}
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatalf("unmarshal registration envelope: %v", err)
+	}
+	if !env.OK {
+		t.Fatalf("registration envelope ok = false: %#v", env.Error)
+	}
+	var registration managementRegistrationResponse
+	if err := json.Unmarshal(env.Result, &registration); err != nil {
+		t.Fatalf("unmarshal registration: %v", err)
+	}
+	for _, resource := range registration.Resources {
+		switch resource.Path {
+		case "/dashboard":
+		case "/summary", "/export":
+			t.Fatalf("resource route %q exposes dynamic data without management auth", resource.Path)
+		default:
+			t.Fatalf("unexpected resource route %q", resource.Path)
+		}
+	}
+	for _, path := range []string{
+		"/v0/resource/plugins/codex-token-usage/summary",
+		"/v0/resource/plugins/codex-token-usage/export",
+	} {
+		resp := handleManagement(managementRequest{Path: path})
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("handleManagement(%q) status = %d, want 404", path, resp.StatusCode)
+		}
+	}
+	resp := handleManagement(managementRequest{Path: "/v0/resource/plugins/codex-token-usage/dashboard"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("dashboard resource status = %d, want 200", resp.StatusCode)
+	}
+}
+
 func TestSanitizeTriggerErrorKeepsErrorText(t *testing.T) {
 	if got := sanitizeTriggerError(errors.New("context canceled")); got != "context canceled" {
 		t.Fatalf("sanitizeTriggerError(error) = %q, want context canceled", got)

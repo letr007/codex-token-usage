@@ -66,7 +66,7 @@ const (
 )
 
 var (
-	pluginVersion    = "0.1.10"
+	pluginVersion    = "0.1.11"
 	pluginAuthor     = "Codex Token Usage Contributors"
 	pluginRepository = "https://github.com/zhumengling/codex-token-usage"
 )
@@ -329,8 +329,6 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			},
 			Resources: []resourceRoute{
 				{Path: "/dashboard", Menu: "Token Usage", Description: "Account token usage dashboard."},
-				{Path: "/summary", Description: "Token usage summary JSON for the dashboard."},
-				{Path: "/export", Description: "Token usage CSV/JSON export for the dashboard."},
 			},
 		})
 	case "management.handle":
@@ -388,22 +386,6 @@ func handleManagement(req managementRequest) managementResponse {
 			Headers:    map[string][]string{"content-type": {"text/html; charset=utf-8"}, "cache-control": {"no-store"}},
 			Body:       []byte(dashboardHTML),
 		}
-	}
-	if strings.HasPrefix(req.Path, "/v0/resource/plugins/"+pluginID+"/summary") {
-		window := firstQuery(req.Query, "window", "24h")
-		limit := parseInt(firstQuery(req.Query, "limit", "50"), 50, 1, 5000)
-		data, err := globalStore.summary(context.Background(), window, limit)
-		if err != nil {
-			return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "summary_failed", "message": err.Error()})
-		}
-		return jsonResponse(http.StatusOK, data)
-	}
-	if strings.HasPrefix(req.Path, "/v0/resource/plugins/"+pluginID+"/export") {
-		window := firstQuery(req.Query, "window", "24h")
-		limit := parseInt(firstQuery(req.Query, "limit", "5000"), 5000, 1, 20000)
-		kind := firstQuery(req.Query, "type", "accounts")
-		format := firstQuery(req.Query, "format", "csv")
-		return handleExport(context.Background(), window, kind, format, limit)
 	}
 	if strings.HasPrefix(req.Path, "/v0/management/plugins/"+pluginID+"/summary") {
 		window := firstQuery(req.Query, "window", "24h")

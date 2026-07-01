@@ -91,11 +91,11 @@ const dashboardBody = `</style>
     <div class="modal-head"><h2 id="batch-proxy-title">批量写入 Codex 代理</h2><button id="batch-proxy-close" class="icon-button ghost" type="button" aria-label="关闭批量写入代理">×</button></div>
     <div class="modal-body">
       <label class="form-row"><span>代理地址</span><input id="batch-proxy-url" autocomplete="off" placeholder="socks5://username:password@proxy_ip:port/"></label>
-      <label class="form-row"><span>管理密钥</span><input id="batch-proxy-key" type="password" autocomplete="current-password" placeholder="CPA 管理密钥"></label>
       <div class="modal-note">只写入 Codex 认证文件的 <code>proxy_url</code> 字段。填写 <code>direct</code> 可批量直连，留空不会执行。</div>
       <div id="batch-proxy-status" class="modal-status" role="status" aria-live="polite">等待输入代理地址。</div>
     </div>
     <div class="modal-actions">
+      <button id="batch-proxy-clear" class="ghost danger-ghost" type="button">清除所有代理</button>
       <button id="batch-proxy-preview" class="ghost" type="button">预览数量</button>
       <button id="batch-proxy-apply" type="button">应用</button>
     </div>

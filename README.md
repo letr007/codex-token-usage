@@ -2,7 +2,7 @@
 
 CPA Token Usage is a CLIProxyAPI plugin for Codex account operation dashboards and AI provider usage analytics.
 
-Current version: `0.1.10`
+Current version: `0.1.11`
 
 ## Features
 
@@ -118,11 +118,11 @@ go test ./...
 Release assets are named in the CLIProxyAPI plugin store format:
 
 ```text
-codex-token-usage_0.1.10_linux_amd64.zip
-codex-token-usage_0.1.10_linux_arm64.zip
-codex-token-usage_0.1.10_windows_amd64.zip
-codex-token-usage_0.1.10_darwin_amd64.zip
-codex-token-usage_0.1.10_darwin_arm64.zip
+codex-token-usage_0.1.11_linux_amd64.zip
+codex-token-usage_0.1.11_linux_arm64.zip
+codex-token-usage_0.1.11_windows_amd64.zip
+codex-token-usage_0.1.11_darwin_amd64.zip
+codex-token-usage_0.1.11_darwin_arm64.zip
 checksums.txt
 ```
 
