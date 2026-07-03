@@ -15,6 +15,8 @@ const cpaSecureStorageSalt='cli-proxy-api-webui::secure-storage';
 let lastData=null;
 let accountPage=1;
 let accountPageSize=25;
+let autobanPage=1;
+let autobanPageSize=10;
 let activePage='codex';
 let selectedProviders=[];
 let providerSelectionSaved=false;
@@ -27,30 +29,33 @@ initBatchProxyControl();
 initUIPreferences();
 applyHostTheme();
 observeHostTheme();
-applyLocale();
 document.getElementById('refresh').onclick=load;
-document.getElementById('window').onchange=e=>{localStorage.setItem('cpa_token_usage_window',e.target.value);load()};
+document.getElementById('window').onchange=e=>{safeStorageSet(safeLocalStorage(),'cpa_token_usage_window',e.target.value);load()};
 document.getElementById('export-csv').onclick=()=>downloadExport('csv');
 document.getElementById('export-json').onclick=()=>downloadExport('json');
 document.getElementById('tab-strip').addEventListener('click',e=>{const btn=e.target.closest('.tab[data-target]');if(btn)switchPage(btn.dataset.target)});
 document.getElementById('provider-picker-button').onclick=()=>document.getElementById('provider-picker').classList.toggle('open');
 document.addEventListener('click',e=>{const picker=document.getElementById('provider-picker');if(!picker.contains(e.target))picker.classList.remove('open')});
 document.getElementById('account-filter').oninput=()=>{accountPage=1;renderAccounts()};
-document.getElementById('account-sort').onchange=e=>{localStorage.setItem('cpa_token_usage_account_sort',e.target.value);accountPage=1;renderAccounts()};
-document.getElementById('account-page-size').onchange=(e)=>{accountPageSize=Number(e.target.value)||25;localStorage.setItem('cpa_token_usage_account_page_size',String(accountPageSize));accountPage=1;renderAccounts()};
+document.getElementById('account-sort').onchange=e=>{safeStorageSet(safeLocalStorage(),'cpa_token_usage_account_sort',e.target.value);accountPage=1;renderAccounts()};
+document.getElementById('account-page-size').onchange=(e)=>{accountPageSize=Number(e.target.value)||25;safeStorageSet(safeLocalStorage(),'cpa_token_usage_account_page_size',String(accountPageSize));accountPage=1;renderAccounts()};
 document.getElementById('account-prev').onclick=()=>{accountPage=Math.max(1,accountPage-1);renderAccounts()};
 document.getElementById('account-next').onclick=()=>{accountPage=accountPage+1;renderAccounts()};
+document.getElementById('autoban-page-size').onchange=(e)=>{autobanPageSize=Number(e.target.value)||10;safeStorageSet(safeLocalStorage(),'cpa_token_usage_autoban_page_size',String(autobanPageSize));autobanPage=1;renderAutobans((lastData&&lastData.autobans)||[])};
+document.getElementById('autoban-prev').onclick=()=>{autobanPage=Math.max(1,autobanPage-1);renderAutobans((lastData&&lastData.autobans)||[])};
+document.getElementById('autoban-next').onclick=()=>{autobanPage=autobanPage+1;renderAutobans((lastData&&lastData.autobans)||[])};
 setInterval(()=>{if(!document.hidden&&!loading&&!document.getElementById('provider-picker').classList.contains('open'))load()},15000);
 function initUIPreferences(){
-  const savedWindow=localStorage.getItem('cpa_token_usage_window'); if(savedWindow&&selectHasValue('window',savedWindow))document.getElementById('window').value=savedWindow;
-  const savedSort=localStorage.getItem('cpa_token_usage_account_sort'); if(savedSort&&selectHasValue('account-sort',savedSort))document.getElementById('account-sort').value=savedSort;
-  const savedPage=Number(localStorage.getItem('cpa_token_usage_account_page_size')||25); if(savedPage){accountPageSize=savedPage;document.getElementById('account-page-size').value=String(savedPage)}
+  const savedWindow=safeStorageGet(safeLocalStorage(),'cpa_token_usage_window'); if(savedWindow&&selectHasValue('window',savedWindow))document.getElementById('window').value=savedWindow;
+  const savedSort=safeStorageGet(safeLocalStorage(),'cpa_token_usage_account_sort'); if(savedSort&&selectHasValue('account-sort',savedSort))document.getElementById('account-sort').value=savedSort;
+  const savedPage=Number(safeStorageGet(safeLocalStorage(),'cpa_token_usage_account_page_size')||25); if(savedPage){accountPageSize=savedPage;document.getElementById('account-page-size').value=String(savedPage)}
+  const savedAutobanPage=Number(safeStorageGet(safeLocalStorage(),'cpa_token_usage_autoban_page_size')||10); if(savedAutobanPage&&selectHasValue('autoban-page-size',String(savedAutobanPage))){autobanPageSize=savedAutobanPage;document.getElementById('autoban-page-size').value=String(savedAutobanPage)}
   initAccountColumns();
 }
 function selectHasValue(id,value){return Array.from(document.getElementById(id).options||[]).some(o=>o.value===value)}
 function accountColumnsKey(){return 'cpa_token_usage_account_columns'}
-function loadAccountColumns(){try{return JSON.parse(localStorage.getItem(accountColumnsKey())||'{}')}catch(e){return {}}}
-function saveAccountColumns(values){localStorage.setItem(accountColumnsKey(),JSON.stringify(values))}
+function loadAccountColumns(){try{return JSON.parse(safeStorageGet(safeLocalStorage(),accountColumnsKey())||'{}')}catch(e){return {}}}
+function saveAccountColumns(values){safeStorageSet(safeLocalStorage(),accountColumnsKey(),JSON.stringify(values))}
 function initAccountColumns(){
   const values=loadAccountColumns();
   document.querySelectorAll('#account-columns input[data-col]').forEach(input=>{
@@ -72,7 +77,7 @@ async function downloadExport(format){
   const params='?window='+encodeURIComponent(document.getElementById('window').value)+'&limit=5000&type='+encodeURIComponent(exportType())+'&format='+encodeURIComponent(format);
   const key=managementKey();
   if(!key){showFallbackKeyInput();document.getElementById('status').textContent=tr('请填写备用 CPA 管理密钥后导出。');return}
-  sessionStorage.setItem('cpa_token_usage_key',key);
+  safeStorageSet(safeSessionStorage(),'cpa_token_usage_key',key);
   const res=await fetch(managementExportApi+params,{headers:{Authorization:'Bearer '+key}});
   if(!res.ok){
     if(res.status===401)rejectManagementKey(key);
@@ -86,8 +91,13 @@ async function downloadExport(format){
   URL.revokeObjectURL(url);
 }
 function languageStorageKey(){return 'cpa_token_usage_language'}
+function safeLocalStorage(){try{return window.localStorage}catch(e){return null}}
+function safeSessionStorage(){try{return window.sessionStorage}catch(e){return null}}
+function safeStorageGet(storage,key){try{return storage?storage.getItem(key):null}catch(e){return null}}
+function safeStorageSet(storage,key,value){try{if(storage)storage.setItem(key,value)}catch(e){}}
+function safeStorageRemove(storage,key){try{if(storage)storage.removeItem(key)}catch(e){}}
 function languageMode(){
-  const mode=localStorage.getItem(languageStorageKey())||'zh';
+  const mode=safeStorageGet(safeLocalStorage(),languageStorageKey())||safeStorageGet(safeSessionStorage(),languageStorageKey())||(languageEl&&languageEl.value)||'zh';
   return mode==='en'?'en':'zh';
 }
 function effectiveLanguage(){
@@ -97,7 +107,8 @@ function initLanguageControl(){
   if(!languageEl)return;
   languageEl.value=languageMode();
   languageEl.onchange=()=>{
-    localStorage.setItem(languageStorageKey(),languageEl.value||'zh');
+    const value=languageEl.value||'zh';
+    safeStorageSet(safeLocalStorage(),languageStorageKey(),value);safeStorageSet(safeSessionStorage(),languageStorageKey(),value);
     refreshLanguage(true);
   };
 }
@@ -118,7 +129,7 @@ function openBatchProxyModal(){
 function closeBatchProxyModal(){batchProxyModal.hidden=true}
 function batchProxyKey(){
   const key=managementKey();
-  if(key){keyEl.value=key;sessionStorage.setItem('cpa_token_usage_key',key)}
+  if(key){keyEl.value=key;safeStorageSet(safeSessionStorage(),'cpa_token_usage_key',key)}
   return key;
 }
 function showFallbackKeyInput(){
@@ -131,34 +142,48 @@ function missingBatchProxyKey(){
 }
 function managementKey(){
   const typed=firstText(keyEl.value);
-  const rejected=sessionStorage.getItem('cpa_token_usage_rejected_key')||'';
+  const rejected=recentRejectedManagementKey();
   let key=typed;
   if(!key){
-    for(const candidate of [cpaStoredManagementKey(),sessionStorage.getItem('cpa_token_usage_key')]){
+    for(const candidate of [cpaStoredManagementKey(),safeStorageGet(safeSessionStorage(),'cpa_token_usage_key')]){
       const value=firstText(candidate);
       if(value&&value!==rejected){key=value;break}
     }
   }
   if(key){
     keyEl.value=key;
-    sessionStorage.setItem('cpa_token_usage_key',key);
-    sessionStorage.removeItem('cpa_token_usage_rejected_key');
+    safeStorageSet(safeSessionStorage(),'cpa_token_usage_key',key);
+    safeStorageRemove(safeSessionStorage(),'cpa_token_usage_rejected_key');
+    safeStorageRemove(safeSessionStorage(),'cpa_token_usage_rejected_at');
     keyEl.classList.remove('on');
   }
   return key;
 }
+function recentRejectedManagementKey(){
+  const storage=safeSessionStorage();
+  const key=safeStorageGet(storage,'cpa_token_usage_rejected_key')||'';
+  if(!key)return '';
+  const ts=Number(safeStorageGet(storage,'cpa_token_usage_rejected_at')||0);
+  if(!ts||Date.now()-ts>5*60*1000){
+    safeStorageRemove(storage,'cpa_token_usage_rejected_key');
+    safeStorageRemove(storage,'cpa_token_usage_rejected_at');
+    return '';
+  }
+  return key;
+}
 function rejectManagementKey(key){
-  if(key)sessionStorage.setItem('cpa_token_usage_rejected_key',key);
-  sessionStorage.removeItem('cpa_token_usage_key');
+  if(key)safeStorageSet(safeSessionStorage(),'cpa_token_usage_rejected_key',key);
+  if(key)safeStorageSet(safeSessionStorage(),'cpa_token_usage_rejected_at',String(Date.now()));
+  safeStorageRemove(safeSessionStorage(),'cpa_token_usage_key');
   keyEl.value='';
   showFallbackKeyInput();
 }
 function cpaStoredManagementKey(){
   return firstText(
-    readCPAStorageValue(sessionStorage,'managementKey'),
-    readCPAStorageValue(localStorage,'managementKey'),
-    readCPAAuthStoreKey(sessionStorage),
-    readCPAAuthStoreKey(localStorage)
+    readCPAStorageValue(safeSessionStorage(),'managementKey'),
+    readCPAStorageValue(safeLocalStorage(),'managementKey'),
+    readCPAAuthStoreKey(safeSessionStorage()),
+    readCPAAuthStoreKey(safeLocalStorage())
   );
 }
 function readCPAAuthStoreKey(storage){
@@ -277,10 +302,10 @@ function switchPage(page){
 }
 function providerStorageKey(){return 'cpa_token_usage_provider_pages'}
 function providerKnownStorageKey(){return 'cpa_token_usage_provider_known'}
-function loadSelectedProviders(){const raw=localStorage.getItem(providerStorageKey());providerSelectionSaved=raw!==null;try{return JSON.parse(raw||'[]').filter(Boolean)}catch(e){return []}}
-function saveSelectedProviders(){providerSelectionSaved=true;localStorage.setItem(providerStorageKey(),JSON.stringify(selectedProviders))}
-function loadKnownProviders(){try{return JSON.parse(localStorage.getItem(providerKnownStorageKey())||'[]').filter(Boolean)}catch(e){return []}}
-function saveKnownProviders(names){localStorage.setItem(providerKnownStorageKey(),JSON.stringify(names))}
+function loadSelectedProviders(){const raw=safeStorageGet(safeLocalStorage(),providerStorageKey());providerSelectionSaved=raw!==null;try{return JSON.parse(raw||'[]').filter(Boolean)}catch(e){return []}}
+function saveSelectedProviders(){providerSelectionSaved=true;safeStorageSet(safeLocalStorage(),providerStorageKey(),JSON.stringify(selectedProviders))}
+function loadKnownProviders(){try{return JSON.parse(safeStorageGet(safeLocalStorage(),providerKnownStorageKey())||'[]').filter(Boolean)}catch(e){return []}}
+function saveKnownProviders(names){safeStorageSet(safeLocalStorage(),providerKnownStorageKey(),JSON.stringify(names))}
 function providerID(name){return 'provider-'+btoa(unescape(encodeURIComponent(name||'unknown'))).replace(/=+$/,'').replace(/[^a-zA-Z0-9_-]/g,'')}
 function providerLabel(name){
   name=String(name||'unknown').trim()||'unknown';
@@ -507,6 +532,10 @@ const i18nEn={
   '状态':'Status',
   '429 自动禁用状态':'429 auto-ban status',
   'Codex reset_at 自动恢复':'Auto recovers at Codex reset_at',
+  '显示 0 / 0 个自动禁用账号':'Showing 0 / 0 auto-banned accounts',
+  '自动禁用每页数量':'Auto-bans per page',
+  '上一页自动禁用账号':'Previous auto-ban page',
+  '下一页自动禁用账号':'Next auto-ban page',
   '窗口':'Window',
   '原因':'Reason',
   '封禁时间':'Banned at',
@@ -635,8 +664,9 @@ function translateNode(root){
   const walk=document.createTreeWalker(root,NodeFilter.SHOW_TEXT,{acceptNode:n=>n.nodeValue.trim()?NodeFilter.FILTER_ACCEPT:NodeFilter.FILTER_REJECT});
   const nodes=[];
   while(walk.nextNode())nodes.push(walk.currentNode);
-  nodes.forEach(n=>{if(n.parentElement&&['SCRIPT','STYLE'].includes(n.parentElement.tagName))return;if(!n.__i18nSource)n.__i18nSource=n.nodeValue;n.nodeValue=tr(n.__i18nSource)});
+  nodes.forEach(n=>{if(n.parentElement&&(['SCRIPT','STYLE'].includes(n.parentElement.tagName)||n.parentElement.closest('[data-no-i18n]')))return;if(!n.__i18nSource)n.__i18nSource=n.nodeValue;n.nodeValue=tr(n.__i18nSource)});
   root.querySelectorAll('[placeholder],[aria-label],[title]').forEach(el=>{
+    if(el.closest('[data-no-i18n]'))return;
     ['placeholder','aria-label','title'].forEach(attr=>{
       if(!el.hasAttribute(attr))return;
       const key='__i18n_'+attr;
@@ -747,7 +777,7 @@ function requestStatusText(r){const code=Number(r.status_code||0)||((r.failed||f
 async function load(){
   if(loading)return;
   loading=true;
-  const key=managementKey(); if(key)sessionStorage.setItem('cpa_token_usage_key',key);
+  const key=managementKey(); if(key)safeStorageSet(safeSessionStorage(),'cpa_token_usage_key',key);
   const win=document.getElementById('window').value;
   const st=document.getElementById('status'); st.textContent=tr('加载中...');
   try{
@@ -1052,8 +1082,24 @@ function renderInsights(data){
 function meterCell(value,width,color){width=Math.max(0,Math.min(100,Number(width||0)));return '<div class="cell-meter"><b>'+esc(value)+'</b><div class="bar"><span style="--color:'+color+';width:'+width.toFixed(1)+'%"></span></div></div>'}
 function quotaText(percent,tokens){const p=pct(percent); const tok=Number(tokens||0)>0?compact(tokens)+' tok':'无窗口 Token'; return p+' · '+tok}
 function quotaCompact(label,value,tokens,resetAt){const width=value==null?0:Math.min(100,Number(value));const title=quotaText(value,tokens);return '<div class="quota-compact" title="'+esc(resetText(resetAt))+'"><span>'+label+'</span><div class="bar"><span style="--color:'+colorForPct(width)+';width:'+width.toFixed(1)+'%"></span></div><b class="'+health(width)+'">'+esc(title)+'</b></div>'}
+function sortAutobansByRemaining(rows){
+  return [...(rows||[])].sort((a,b)=>autobanRemainingSortValue(a)-autobanRemainingSortValue(b)||Number(a.reset_at||0)-Number(b.reset_at||0));
+}
+function autobanRemainingSortValue(r){
+  const seconds=Number(r&&r.seconds_remaining);
+  return Number.isFinite(seconds)?Math.max(0,seconds):Number.MAX_SAFE_INTEGER;
+}
 function renderAutobans(rows){
-  document.getElementById('autobans').innerHTML=rows.map(r=>'<tr>'+
+  rows=sortAutobansByRemaining(rows);
+  const pages=Math.max(1,Math.ceil(rows.length/autobanPageSize));
+  autobanPage=Math.max(1,Math.min(autobanPage,pages));
+  const start=(autobanPage-1)*autobanPageSize;
+  const pageRows=rows.slice(start,start+autobanPageSize);
+  document.getElementById('autoban-scope').textContent='显示 '+(rows.length?start+1:0)+'-'+Math.min(start+pageRows.length,rows.length)+' / '+rows.length+' 个自动禁用账号';
+  document.getElementById('autoban-page-label').textContent=autobanPage+' / '+pages;
+  document.getElementById('autoban-prev').disabled=autobanPage<=1;
+  document.getElementById('autoban-next').disabled=autobanPage>=pages;
+  document.getElementById('autobans').innerHTML=pageRows.map(r=>'<tr>'+
     td(esc(r.source||r.auth_id||'-'))+td(esc(r.auth_index||'-'))+td(esc(r.window||'-'))+td(esc(r.reason||'-'))+
     td(esc(r.banned_at_text||'-'))+td(esc(r.reset_at_text||'-'))+td(duration(r.seconds_remaining),'num')+
     td(pct(r.primary_used_percent),'num')+td(pct(r.secondary_used_percent),'num')+'</tr>').join('') || '<tr><td colspan="9" class="muted">当前没有被 429 自动禁用的 Codex 账号</td></tr>';
@@ -1079,6 +1125,7 @@ function renderRecent(target,rows,mode){
     '</tr>';
   }).join('') || '<tr><td colspan="5" class="muted">暂无请求记录</td></tr>';
 }
+applyLocale();
 load();
 
 `

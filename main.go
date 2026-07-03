@@ -62,7 +62,7 @@ const (
 	pluginID                    = "codex-token-usage"
 	codexQuotaAPIURL            = "https://chatgpt.com/backend-api/wham/usage"
 	codexResponsesAPIURL        = "https://chatgpt.com/backend-api/codex/responses/compact"
-	codexProbeModel             = "gpt-5-codex"
+	codexProbeModel             = "gpt-5.5"
 )
 
 var (
@@ -85,8 +85,9 @@ type envelope struct {
 }
 
 type envelopeError struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	Code       string `json:"code"`
+	Message    string `json:"message"`
+	HTTPStatus int    `json:"http_status,omitempty"`
 }
 
 type pluginRegisterResponse struct {
@@ -211,6 +212,22 @@ type schedulerPickResponse struct {
 	AuthID          string `json:"AuthID"`
 	DelegateBuiltin string `json:"DelegateBuiltin"`
 	Handled         bool   `json:"Handled"`
+}
+
+type schedulerRejectError struct {
+	Code       string
+	Message    string
+	HTTPStatus int
+}
+
+func (e *schedulerRejectError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.Code == "" {
+		return e.Message
+	}
+	return e.Code + ": " + e.Message
 }
 
 type usageRecord struct {
@@ -353,6 +370,10 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		}
 		resp, err := globalStore.pickAuth(context.Background(), req)
 		if err != nil {
+			var reject *schedulerRejectError
+			if errors.As(err, &reject) && reject != nil {
+				return errorEnvelopeWithStatus(reject.Code, reject.Message, reject.HTTPStatus), nil
+			}
 			return okJSON(schedulerPickResponse{Handled: false})
 		}
 		return okJSON(resp)
@@ -1167,7 +1188,7 @@ func executeQuotaProbeRequest(ctx context.Context, db *sql.DB, account triggerAu
 	headers := map[string][]string{
 		"Authorization": {"Bearer " + account.AccessToken},
 		"Content-Type":  {"application/json"},
-		"Accept":        {"application/json"},
+		"Accept":        {"text/event-stream"},
 		"Connection":    {"Keep-Alive"},
 		"Originator":    {"codex-tui"},
 		"User-Agent":    {"codex-tui/0.135.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.135.0)"},
@@ -1180,6 +1201,20 @@ func executeQuotaProbeRequest(ctx context.Context, db *sql.DB, account triggerAu
 		run.Error = sanitizeTriggerError(err)
 		run.FinishedAt = time.Now().Unix()
 		return run
+	}
+	if shouldRetryMinimalCodexProbe(resp.StatusCode, respBody) {
+		body, err = codexProbeMinimalRequestBody(codexProbeModel)
+		if err != nil {
+			run.Error = sanitizeTriggerError(err)
+			run.FinishedAt = time.Now().Unix()
+			return run
+		}
+		resp, respBody, err = doQuotaTriggerHTTPRequest(reqCtx, http.MethodPost, codexResponsesURL(), headers, body)
+		if err != nil {
+			run.Error = sanitizeTriggerError(err)
+			run.FinishedAt = time.Now().Unix()
+			return run
+		}
 	}
 
 	run.HTTPStatus = resp.StatusCode
@@ -1242,13 +1277,46 @@ func codexProbeRequestBody(model string) ([]byte, error) {
 		model = codexProbeModel
 	}
 	return json.Marshal(map[string]any{
-		"model":             model,
-		"input":             "ping",
-		"instructions":      "Reply with OK.",
-		"max_output_tokens": 1,
-		"stream":            false,
-		"store":             false,
+		"model":        model,
+		"instructions": "Reply with OK.",
+		"input":        codexProbeInput(),
+		"stream":       true,
+		"store":        false,
 	})
+}
+
+func codexProbeMinimalRequestBody(model string) ([]byte, error) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		model = codexProbeModel
+	}
+	return json.Marshal(map[string]any{
+		"model":        model,
+		"instructions": "Reply with OK.",
+		"input":        codexProbeInput(),
+	})
+}
+
+func codexProbeInput() []map[string]any {
+	return []map[string]any{
+		{
+			"role": "user",
+			"content": []map[string]any{
+				{"type": "input_text", "text": "ping"},
+			},
+		},
+	}
+}
+
+func shouldRetryMinimalCodexProbe(status int, body []byte) bool {
+	if status != http.StatusBadRequest {
+		return false
+	}
+	text := strings.ToLower(string(body))
+	if !strings.Contains(text, "unknown_parameter") && !strings.Contains(text, "unknown parameter") {
+		return false
+	}
+	return strings.Contains(text, "stream") || strings.Contains(text, "store")
 }
 
 func doQuotaTriggerHTTPRequest(ctx context.Context, method, targetURL string, headers map[string][]string, body []byte) (quotaTriggerHTTPResponse, []byte, error) {
@@ -1744,7 +1812,7 @@ func (s *store) pickAuth(ctx context.Context, req schedulerPickRequest) (schedul
 		return schedulerPickResponse{Handled: false}, nil
 	}
 	if len(available) == 0 {
-		return schedulerPickResponse{Handled: false}, nil
+		return schedulerPickResponse{}, newNoAvailableCodexAuthError(bans, now)
 	}
 	chosen := available[0]
 	for _, candidate := range available[1:] {
@@ -1753,6 +1821,31 @@ func (s *store) pickAuth(ctx context.Context, req schedulerPickRequest) (schedul
 		}
 	}
 	return schedulerPickResponse{AuthID: chosen.ID, Handled: true}, nil
+}
+
+func newNoAvailableCodexAuthError(bans []autobanRow, now int64) error {
+	message := "no available Codex auth candidates: all candidates are auto-banned by 429 or marked invalid"
+	if resetAt := earliestActiveBanReset(bans, now); resetAt > 0 {
+		message += "; earliest autoban reset at " + unixTime(resetAt)
+	}
+	return &schedulerRejectError{
+		Code:       "auth_unavailable",
+		Message:    message,
+		HTTPStatus: http.StatusServiceUnavailable,
+	}
+}
+
+func earliestActiveBanReset(bans []autobanRow, now int64) int64 {
+	var earliest int64
+	for _, ban := range bans {
+		if !ban.Active || ban.ResetAt <= now {
+			continue
+		}
+		if earliest == 0 || ban.ResetAt < earliest {
+			earliest = ban.ResetAt
+		}
+	}
+	return earliest
 }
 
 func isCodexSchedulerRequest(req schedulerPickRequest) bool {

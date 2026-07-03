@@ -56,6 +56,107 @@ func TestResourceRoutesExposeOnlyStaticDashboard(t *testing.T) {
 	}
 }
 
+func TestDashboardHasAutobanPaginationAndBottomInset(t *testing.T) {
+	for _, id := range []string{
+		`id="autoban-scope"`,
+		`id="autoban-page-size"`,
+		`id="autoban-prev"`,
+		`id="autoban-page-label"`,
+		`id="autoban-next"`,
+		`class="scroll autoban-table-wrap"`,
+	} {
+		if !strings.Contains(dashboardHTML, id) {
+			t.Fatalf("dashboardHTML missing %s", id)
+		}
+	}
+	if !strings.Contains(dashboardHTML, "padding:10px 10px 34px") {
+		t.Fatalf("dashboardHTML missing desktop bottom inset")
+	}
+	if !strings.Contains(dashboardHTML, "main{padding:7px 7px 28px") {
+		t.Fatalf("dashboardHTML missing mobile bottom inset")
+	}
+	for _, snippet := range []string{
+		`let autobanPage=1;`,
+		`let autobanPageSize=10;`,
+		`cpa_token_usage_autoban_page_size`,
+		`renderAutobans((lastData&&lastData.autobans)||[])`,
+		`sortAutobansByRemaining(rows)`,
+		`const pageRows=rows.slice(start,start+autobanPageSize);`,
+		`document.getElementById('autoban-next').disabled=autobanPage>=pages;`,
+	} {
+		if !strings.Contains(dashboardHTML, snippet) {
+			t.Fatalf("dashboardHTML missing autoban pagination script %q", snippet)
+		}
+	}
+}
+
+func TestDashboardLanguageSelectionPersistsAndIsNotTranslated(t *testing.T) {
+	for _, snippet := range []string{
+		`id="language" data-no-i18n`,
+		`function safeStorageGet(storage,key)`,
+		`function safeStorageSet(storage,key,value)`,
+		`function safeStorageRemove(storage,key)`,
+		`languageEl&&languageEl.value`,
+		`safeStorageSet(safeLocalStorage(),languageStorageKey(),value);safeStorageSet(safeSessionStorage(),languageStorageKey(),value)`,
+		`n.parentElement.closest('[data-no-i18n]')`,
+		`el.closest('[data-no-i18n]')`,
+	} {
+		if !strings.Contains(dashboardHTML, snippet) {
+			t.Fatalf("dashboardHTML missing language persistence/isolation snippet %q", snippet)
+		}
+	}
+}
+
+func TestDashboardAppliesLocaleAfterTranslationsAreInitialized(t *testing.T) {
+	translations := strings.Index(dashboardHTML, "const i18nEn={")
+	apply := strings.Index(dashboardHTML, "applyLocale();")
+	if translations < 0 || apply < 0 {
+		t.Fatalf("dashboardHTML missing translations/applyLocale")
+	}
+	if apply < translations {
+		t.Fatalf("applyLocale runs before i18nEn is initialized")
+	}
+}
+
+func TestDashboardRejectedManagementKeyExpires(t *testing.T) {
+	for _, snippet := range []string{
+		`function recentRejectedManagementKey(){`,
+		`cpa_token_usage_rejected_at`,
+		`Date.now()-ts>5*60*1000`,
+		`safeStorageRemove(storage,'cpa_token_usage_rejected_key')`,
+		`safeStorageSet(safeSessionStorage(),'cpa_token_usage_rejected_at',String(Date.now()))`,
+	} {
+		if !strings.Contains(dashboardHTML, snippet) {
+			t.Fatalf("dashboardHTML missing rejected key expiry snippet %q", snippet)
+		}
+	}
+}
+
+func TestDashboardStorageAccessIsGuarded(t *testing.T) {
+	if strings.Contains(dashboardHTML, "localStorage.") || strings.Contains(dashboardHTML, "sessionStorage.") {
+		t.Fatalf("dashboardHTML contains direct storage access; use safeStorage helpers so refresh cannot abort initialization")
+	}
+	for _, snippet := range []string{
+		"safeStorageGet(localStorage,",
+		"safeStorageSet(localStorage,",
+		"safeStorageGet(sessionStorage,",
+		"safeStorageSet(sessionStorage,",
+		"safeStorageRemove(sessionStorage,",
+	} {
+		if strings.Contains(dashboardHTML, snippet) {
+			t.Fatalf("dashboardHTML contains unsafe storage object access %q", snippet)
+		}
+	}
+	for _, snippet := range []string{
+		`function safeLocalStorage(){try{return window.localStorage}catch(e){return null}}`,
+		`function safeSessionStorage(){try{return window.sessionStorage}catch(e){return null}}`,
+	} {
+		if !strings.Contains(dashboardHTML, snippet) {
+			t.Fatalf("dashboardHTML missing storage accessor %q", snippet)
+		}
+	}
+}
+
 func TestSanitizeTriggerErrorKeepsErrorText(t *testing.T) {
 	if got := sanitizeTriggerError(errors.New("context canceled")); got != "context canceled" {
 		t.Fatalf("sanitizeTriggerError(error) = %q, want context canceled", got)
@@ -114,6 +215,99 @@ func TestCodex429AutobanFiltersSchedulerCandidate(t *testing.T) {
 	}
 	if bans[0].AuthID != "auth-banned" || bans[0].Window != "5h" {
 		t.Fatalf("ban = %+v, want auth-banned 5h", bans[0])
+	}
+}
+
+func TestCodex429AutobanRejectsWhenAllCandidatesFiltered(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+
+	resetAt := time.Now().Add(time.Hour).Unix()
+	if err := store.recordUsage(ctx, usageRecord{
+		Provider:    "codex",
+		AuthID:      "auth-banned",
+		AuthIndex:   "idx-banned",
+		Source:      "banned@example.com",
+		RequestedAt: time.Now(),
+		Failed:      true,
+		Failure:     usageFailure{StatusCode: http.StatusTooManyRequests},
+		ResponseHeaders: map[string][]string{
+			"x-codex-primary-used-percent":   {"100"},
+			"x-codex-primary-reset-at":       {intToString(resetAt)},
+			"x-codex-primary-window-minutes": {"300"},
+		},
+	}); err != nil {
+		t.Fatalf("recordUsage returned error: %v", err)
+	}
+
+	resp, err := store.pickAuth(ctx, schedulerPickRequest{
+		Provider: "codex",
+		Candidates: []schedulerAuthCandidate{
+			{ID: "auth-banned", Provider: "codex", Priority: 100},
+		},
+	})
+	if err == nil {
+		t.Fatalf("pickAuth returned nil error with response %+v, want scheduler rejection", resp)
+	}
+	if !strings.Contains(err.Error(), "no available Codex auth") {
+		t.Fatalf("pickAuth error = %q, want no available Codex auth", err.Error())
+	}
+}
+
+func TestSchedulerPickRejectsAllBannedWithHTTPStatus(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	globalStore.close()
+	t.Cleanup(globalStore.close)
+
+	resetAt := time.Now().Add(time.Hour).Unix()
+	if err := globalStore.recordUsage(context.Background(), usageRecord{
+		Provider:    "codex",
+		AuthID:      "auth-banned",
+		AuthIndex:   "idx-banned",
+		Source:      "banned@example.com",
+		RequestedAt: time.Now(),
+		Failed:      true,
+		Failure:     usageFailure{StatusCode: http.StatusTooManyRequests},
+		ResponseHeaders: map[string][]string{
+			"x-codex-primary-used-percent":   {"100"},
+			"x-codex-primary-reset-at":       {intToString(resetAt)},
+			"x-codex-primary-window-minutes": {"300"},
+		},
+	}); err != nil {
+		t.Fatalf("recordUsage returned error: %v", err)
+	}
+
+	rawReq, err := json.Marshal(schedulerPickRequest{
+		Provider: "codex",
+		Candidates: []schedulerAuthCandidate{
+			{ID: "auth-banned", Provider: "codex", Priority: 100},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal scheduler request: %v", err)
+	}
+	raw, err := handleMethod("scheduler.pick", rawReq)
+	if err != nil {
+		t.Fatalf("scheduler.pick returned error: %v", err)
+	}
+	var env struct {
+		OK    bool `json:"ok"`
+		Error *struct {
+			Code       string `json:"code"`
+			Message    string `json:"message"`
+			HTTPStatus int    `json:"http_status"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatalf("unmarshal scheduler envelope: %v", err)
+	}
+	if env.OK || env.Error == nil {
+		t.Fatalf("scheduler envelope = %s, want error envelope", string(raw))
+	}
+	if env.Error.Code != "auth_unavailable" || env.Error.HTTPStatus != http.StatusServiceUnavailable {
+		t.Fatalf("scheduler error = %+v, want auth_unavailable status 503", env.Error)
 	}
 }
 
@@ -807,6 +1001,55 @@ func TestSummaryUsesLatestQuotaSnapshotInsteadOfMaxPercent(t *testing.T) {
 	}
 }
 
+func TestSummaryIgnoresFailedUsageQuotaSnapshotUnlessRateLimited(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	t.Setenv("CPA_AUTH_DIR", t.TempDir())
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+
+	resetAt := time.Now().Add(5 * 24 * time.Hour).Unix()
+	if err := store.recordUsage(ctx, usageRecord{
+		Provider:    "codex",
+		AuthID:      "failed-quota@example.com",
+		AuthIndex:   "failed-quota",
+		Source:      "failed-quota@example.com",
+		RequestedAt: time.Now().Add(-30 * time.Minute),
+		Failed:      true,
+		Failure:     usageFailure{StatusCode: http.StatusTooManyRequests},
+		ResponseHeaders: map[string][]string{
+			"x-codex-secondary-used-percent": {"99"},
+			"x-codex-secondary-reset-at":     {intToString(resetAt)},
+		},
+	}); err != nil {
+		t.Fatalf("record 429 snapshot returned error: %v", err)
+	}
+	if err := store.recordUsage(ctx, usageRecord{
+		Provider:    "codex",
+		AuthID:      "failed-quota@example.com",
+		AuthIndex:   "failed-quota",
+		Source:      "failed-quota@example.com",
+		RequestedAt: time.Now().Add(-5 * time.Minute),
+		Failed:      true,
+		Failure:     usageFailure{StatusCode: 599},
+		ResponseHeaders: map[string][]string{
+			"x-codex-secondary-used-percent": {"46"},
+			"x-codex-secondary-reset-at":     {intToString(time.Now().Add(6 * 24 * time.Hour).Unix())},
+		},
+	}); err != nil {
+		t.Fatalf("record failed snapshot returned error: %v", err)
+	}
+
+	data, err := store.summary(ctx, "24h", 10)
+	if err != nil {
+		t.Fatalf("summary returned error: %v", err)
+	}
+	accounts := data["accounts"].([]accountRow)
+	if len(accounts) != 1 || accounts[0].SecondaryUsedPercent == nil || math.Abs(*accounts[0].SecondaryUsedPercent-99) > 0.000001 {
+		t.Fatalf("accounts = %#v, want 429 secondary percent 99 to survive later 599 snapshot", accounts)
+	}
+}
+
 func TestQuotaTriggerDefaultConfigIsDisabled(t *testing.T) {
 	cfg := normalizePluginConfig(defaultPluginConfig())
 	if cfg.QuotaTriggerEnabled {
@@ -861,12 +1104,22 @@ func TestQuotaTriggerQuotaModeUpdatesSnapshotAndCooldown(t *testing.T) {
 		if got := r.Header.Get("Authorization"); got != "Bearer secret-access-token" {
 			t.Fatalf("authorization header = %q, want bearer token", got)
 		}
+		if got := r.Header.Get("Accept"); got != "text/event-stream" {
+			t.Fatalf("accept header = %q, want text/event-stream", got)
+		}
 		var req map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("decode probe body: %v", err)
 		}
-		if req["model"] != codexProbeModel || req["stream"] != false {
-			t.Fatalf("probe body = %#v, want model %s and non-stream", req, codexProbeModel)
+		if req["model"] != codexProbeModel || req["stream"] != true {
+			t.Fatalf("probe body = %#v, want model %s and stream", req, codexProbeModel)
+		}
+		if _, ok := req["max_output_tokens"]; ok {
+			t.Fatalf("probe body = %#v, want no max_output_tokens", req)
+		}
+		input, ok := req["input"].([]any)
+		if !ok || len(input) != 1 {
+			t.Fatalf("probe input = %#v, want one Codex responses input item", req["input"])
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(fmt.Sprintf(`{"rate_limit":{"primary_window":{"used_percent":12.5,"reset_at":%d,"limit_window_seconds":18000},"secondary_window":{"used_percent":22.5,"reset_at":%d,"limit_window_seconds":604800,"remaining_tokens":775,"limit_tokens":1000}}}`, resetAt, resetAt)))
@@ -910,6 +1163,105 @@ func TestQuotaTriggerQuotaModeUpdatesSnapshotAndCooldown(t *testing.T) {
 	}
 	if success != 0 || failed != 0 || skipped != 1 || candidates != 0 {
 		t.Fatalf("second round = success %d failed %d skipped %d candidates %d, want cooldown skip 0/0/1/0", success, failed, skipped, candidates)
+	}
+}
+
+func TestCodexProbeRequestBodyUsesResponsesInputFormat(t *testing.T) {
+	body, err := codexProbeRequestBody("")
+	if err != nil {
+		t.Fatalf("codexProbeRequestBody returned error: %v", err)
+	}
+	var req map[string]any
+	if err := json.Unmarshal(body, &req); err != nil {
+		t.Fatalf("decode probe body: %v", err)
+	}
+	if req["model"] != codexProbeModel {
+		t.Fatalf("model = %#v, want %s", req["model"], codexProbeModel)
+	}
+	if req["stream"] != true {
+		t.Fatalf("stream = %#v, want true", req["stream"])
+	}
+	if _, ok := req["max_output_tokens"]; ok {
+		t.Fatalf("body = %#v, want no max_output_tokens", req)
+	}
+	input, ok := req["input"].([]any)
+	if !ok || len(input) != 1 {
+		t.Fatalf("input = %#v, want one item array", req["input"])
+	}
+	message, ok := input[0].(map[string]any)
+	if !ok || message["role"] != "user" {
+		t.Fatalf("input[0] = %#v, want user message", input[0])
+	}
+	content, ok := message["content"].([]any)
+	if !ok || len(content) != 1 {
+		t.Fatalf("content = %#v, want one content item", message["content"])
+	}
+	part, ok := content[0].(map[string]any)
+	if !ok || part["type"] != "input_text" || part["text"] != "ping" {
+		t.Fatalf("content[0] = %#v, want input_text ping", content[0])
+	}
+}
+
+func TestQuotaTriggerRetriesMinimalProbeWhenStreamUnsupported(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	t.Setenv("CPA_AUTH_DIR", t.TempDir())
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+
+	resetAt := time.Now().Add(2 * time.Hour).Unix()
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		var req map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode probe body: %v", err)
+		}
+		switch calls {
+		case 1:
+			if req["stream"] != true || req["store"] != false {
+				t.Fatalf("first probe body = %#v, want streaming body", req)
+			}
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"Unknown parameter: 'stream'.","type":"invalid_request_error","param":"stream","code":"unknown_parameter"}}`))
+		case 2:
+			if _, ok := req["stream"]; ok {
+				t.Fatalf("fallback body = %#v, want no stream", req)
+			}
+			if _, ok := req["store"]; ok {
+				t.Fatalf("fallback body = %#v, want no store", req)
+			}
+			if _, ok := req["max_output_tokens"]; ok {
+				t.Fatalf("fallback body = %#v, want no max_output_tokens", req)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"rate_limit":{"primary_window":{"used_percent":45,"reset_at":%d},"secondary_window":{"used_percent":29,"reset_at":%d}}}`, resetAt, resetAt)))
+		default:
+			t.Fatalf("unexpected probe call %d", calls)
+		}
+	}))
+	defer server.Close()
+	withCodexQuotaURLForTest(t, server.URL)
+
+	db, _, err := store.open(ctx)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	run := executeQuotaProbeRequest(ctx, db, triggerAuthAccount{
+		configuredAccount: configuredAccount{
+			AuthID:    "fallback@example.com",
+			AuthIndex: "fallback.cpa.json",
+			Source:    "fallback@example.com",
+			AuthFile:  "fallback.cpa.json",
+			Provider:  "codex",
+		},
+		AccessToken: "secret-access-token",
+	}, normalizePluginConfig(defaultPluginConfig()))
+	if calls != 2 {
+		t.Fatalf("probe calls = %d, want retry", calls)
+	}
+	if run.Status != "success" || run.HTTPStatus != http.StatusOK || run.PrimaryUsedPercent == nil || *run.PrimaryUsedPercent != 45 {
+		t.Fatalf("run = %+v, want successful fallback quota snapshot", run)
 	}
 }
 

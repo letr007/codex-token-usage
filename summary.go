@@ -1148,7 +1148,9 @@ SELECT ` + percentColumn + `, ` + resetColumn + `
 FROM (
   SELECT id, requested_at AS observed_at, auth_index, auth_id, source, '' AS auth_file, ` + percentColumn + `, ` + resetColumn + `
   FROM usage_events
-  WHERE requested_at >= ? AND (` + percentColumn + ` IS NOT NULL OR ` + resetColumn + ` IS NOT NULL)
+  WHERE requested_at >= ?
+  AND (` + trustedUsageQuotaSnapshotSQL() + `)
+  AND (` + percentColumn + ` IS NOT NULL OR ` + resetColumn + ` IS NOT NULL)
   UNION ALL
   SELECT id, finished_at AS observed_at, auth_index, auth_id, source, auth_file, ` + percentColumn + `, ` + resetColumn + `
   FROM quota_trigger_runs
@@ -1175,6 +1177,10 @@ LIMIT 1`
 		}
 	}
 	return percent, reset
+}
+
+func trustedUsageQuotaSnapshotSQL() string {
+	return "((failed=0 AND (status_code=0 OR (status_code >= 200 AND status_code < 300))) OR status_code=429)"
 }
 
 func applyAccountQuotaSnapshot(account *accountRow, pp sql.NullFloat64, pr sql.NullInt64, sp sql.NullFloat64, sr sql.NullInt64) {
@@ -1293,6 +1299,7 @@ FROM (
   FROM usage_events
   WHERE requested_at >= ?
   AND `+usageScopeSQL("codex")+`
+  AND (`+trustedUsageQuotaSnapshotSQL()+`)
   AND (primary_used_percent IS NOT NULL OR secondary_used_percent IS NOT NULL)
   AND (auth_index <> '' OR auth_id <> '' OR source <> '')
   AND NOT (executor_type='quota-trigger' OR model='quota-trigger' OR alias='quota-trigger')

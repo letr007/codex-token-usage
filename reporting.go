@@ -294,6 +294,10 @@ func okJSON(v any) ([]byte, error) {
 }
 
 func errorEnvelope(code, message string) []byte {
-	raw, _ := json.Marshal(envelope{OK: false, Error: &envelopeError{Code: code, Message: message}})
+	return errorEnvelopeWithStatus(code, message, 0)
+}
+
+func errorEnvelopeWithStatus(code, message string, status int) []byte {
+	raw, _ := json.Marshal(envelope{OK: false, Error: &envelopeError{Code: code, Message: message, HTTPStatus: status}})
 	return raw
 }
