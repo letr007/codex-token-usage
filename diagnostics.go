@@ -513,10 +513,6 @@ func handleExport(ctx context.Context, window, kind, format string, limit int) m
 
 func handleExportWithFilters(ctx context.Context, window, kind, format string, limit int, query map[string][]string) managementResponse {
 	if strings.EqualFold(strings.TrimSpace(kind), "logs") {
-		db, _, err := globalStore.open(ctx)
-		if err != nil {
-			return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "open_failed", "message": err.Error()})
-		}
 		filters := logExportFilter{
 			Window:   window,
 			Scope:    firstQuery(query, "scope", "codex"),
@@ -527,16 +523,30 @@ func handleExportWithFilters(ctx context.Context, window, kind, format string, l
 			Status:   firstQuery(query, "status", "all"),
 			Limit:    limit,
 		}
-		records, headers, err := exportLogRecords(ctx, db, filters, defaultModelPrices())
+		type logExportResult struct {
+			records []map[string]string
+			headers []string
+		}
+		result, err := withSQLiteAutoRepair(ctx, globalStore, "log export", func() (logExportResult, error) {
+			db, _, err := globalStore.open(ctx)
+			if err != nil {
+				return logExportResult{}, err
+			}
+			records, headers, err := exportLogRecords(ctx, db, filters, defaultModelPrices())
+			if err != nil {
+				return logExportResult{}, err
+			}
+			return logExportResult{records: records, headers: headers}, nil
+		})
 		if err != nil {
 			return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "export_failed", "message": err.Error()})
 		}
 		name := exportLogFileName(filters, format)
 		if strings.EqualFold(format, "json") {
-			body, _ := json.MarshalIndent(records, "", "  ")
+			body, _ := json.MarshalIndent(result.records, "", "  ")
 			return managementResponse{StatusCode: http.StatusOK, Headers: exportHeaders("application/json; charset=utf-8", name), Body: body}
 		}
-		body, err := recordsToCSV(headers, records)
+		body, err := recordsToCSV(result.headers, result.records)
 		if err != nil {
 			return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "export_failed", "message": err.Error()})
 		}

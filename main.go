@@ -54,19 +54,20 @@ import (
 	"time"
 	"unsafe"
 
-	_ "github.com/mattn/go-sqlite3"
+	sqlite3 "github.com/mattn/go-sqlite3"
 )
 
 const (
-	abiVersion           uint32 = 1
-	pluginID                    = "codex-token-usage"
-	codexQuotaAPIURL            = "https://chatgpt.com/backend-api/wham/usage"
-	codexResponsesAPIURL        = "https://chatgpt.com/backend-api/codex/responses/compact"
-	codexProbeModel             = "gpt-5.5"
+	abiVersion            uint32 = 1
+	pluginID                     = "codex-token-usage"
+	codexQuotaAPIURL             = "https://chatgpt.com/backend-api/wham/usage"
+	codexResponsesAPIURL         = "https://chatgpt.com/backend-api/codex/responses/compact"
+	codexProbeModel              = "gpt-5.5"
+	dbHealthCheckInterval        = 10 * time.Minute
 )
 
 var (
-	pluginVersion    = "0.1.16"
+	pluginVersion    = "0.1.17"
 	pluginAuthor     = "Codex Token Usage Contributors"
 	pluginRepository = "https://github.com/zhumengling/codex-token-usage"
 )
@@ -75,6 +76,8 @@ var globalStore = &store{}
 var globalQuotaTrigger = &quotaTriggerManager{}
 var globalModelPriceUpdater = &modelPriceUpdateManager{}
 var globalRetentionCleaner = &retentionCleaner{}
+var globalDBHealth = &dbHealthMonitor{}
+var globalSummaryMaintenance = &summaryMaintenanceManager{}
 var globalSchedulerDiagnostics = &schedulerDiagnosticsTracker{}
 var globalSummaryPrecomputer = &summaryPrecomputeManager{}
 var codexQuotaURLOverrideForTest string
@@ -324,6 +327,8 @@ func cliproxyPluginShutdown() {
 	globalQuotaTrigger.stop()
 	globalModelPriceUpdater.stop()
 	globalRetentionCleaner.stop()
+	globalDBHealth.stop()
+	globalSummaryMaintenance.stop()
 	globalSummaryPrecomputer.stop()
 	globalStore.close()
 }
@@ -422,9 +427,15 @@ func handleManagement(req managementRequest) managementResponse {
 		window := firstQuery(req.Query, "window", "24h")
 		limit := parseInt(firstQuery(req.Query, "limit", "50"), 50, 1, 5000)
 		forceRefresh := parseBoolString(firstQuery(req.Query, "refresh", "false"), false)
+		syncRefresh := forceRefresh && parseBoolString(firstQuery(req.Query, "sync", "false"), false)
 		var data map[string]any
 		var err error
-		if forceRefresh {
+		if syncRefresh {
+			if err := globalStore.runSummaryMaintenance(context.Background()); err != nil {
+				return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "summary_failed", "message": err.Error()})
+			}
+			data, err = globalSummaryPrecomputer.summarySync(context.Background(), globalStore, window, limit)
+		} else if forceRefresh {
 			data, err = globalSummaryPrecomputer.summaryFresh(context.Background(), globalStore, window, limit)
 		} else {
 			data, err = globalSummaryPrecomputer.summary(context.Background(), globalStore, window, limit)
@@ -508,6 +519,8 @@ func configurePlugin(request []byte) error {
 	globalQuotaTrigger.configure(cfg)
 	globalModelPriceUpdater.configure(cfg)
 	globalRetentionCleaner.configure(cfg)
+	globalDBHealth.configure(cfg)
+	globalSummaryMaintenance.configure(cfg)
 	globalSummaryPrecomputer.configure(cfg)
 	return nil
 }
@@ -695,9 +708,10 @@ func jsonResponse(status int, v any) managementResponse {
 }
 
 type store struct {
-	mu     sync.Mutex
-	db     *sql.DB
-	dbPath string
+	mu       sync.Mutex
+	repairMu sync.Mutex
+	db       *sql.DB
+	dbPath   string
 }
 
 func (s *store) open(ctx context.Context) (*sql.DB, string, error) {
@@ -706,41 +720,55 @@ func (s *store) open(ctx context.Context) (*sql.DB, string, error) {
 	if s.db != nil {
 		return s.db, s.dbPath, nil
 	}
-	dir := strings.TrimSpace(os.Getenv("CPA_TOKEN_USAGE_DIR"))
-	if dir == "" {
-		dir = "/root/.cli-proxy-api/plugins/codex-token-usage"
-	}
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return nil, "", err
-	}
-	path := filepath.Join(dir, "usage.db")
-	db, err := sql.Open("sqlite3", path+"?_busy_timeout=5000&_journal_mode=WAL")
+	path, err := usageDBPath()
 	if err != nil {
 		return nil, "", err
 	}
-	if _, err := db.ExecContext(ctx, schemaSQL); err != nil {
-		_ = db.Close()
+	db, err := openSQLiteDB(path)
+	if err != nil {
 		return nil, "", err
 	}
-	if err := normalizeStoredResetColumns(ctx, db); err != nil {
-		_ = db.Close()
-		return nil, "", err
-	}
-	if err := ensureUsageEventColumns(ctx, db); err != nil {
-		_ = db.Close()
-		return nil, "", err
-	}
-	if err := normalizeStoredLatencyColumns(ctx, db); err != nil {
-		_ = db.Close()
-		return nil, "", err
-	}
-	if err := ensureQuotaTriggerRunColumns(ctx, db); err != nil {
+	if err := initializeSQLiteStore(ctx, db); err != nil {
 		_ = db.Close()
 		return nil, "", err
 	}
 	s.db = db
 	s.dbPath = path
 	return db, path, nil
+}
+
+func usageDBPath() (string, error) {
+	dir := strings.TrimSpace(os.Getenv("CPA_TOKEN_USAGE_DIR"))
+	if dir == "" {
+		dir = "/root/.cli-proxy-api/plugins/codex-token-usage"
+	}
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "usage.db"), nil
+}
+
+func openSQLiteDB(path string) (*sql.DB, error) {
+	return sql.Open("sqlite3", path+"?_busy_timeout=5000&_journal_mode=WAL")
+}
+
+func initializeSQLiteStore(ctx context.Context, db *sql.DB) error {
+	if _, err := db.ExecContext(ctx, schemaSQL); err != nil {
+		return err
+	}
+	if err := normalizeStoredResetColumns(ctx, db); err != nil {
+		return err
+	}
+	if err := ensureUsageEventColumns(ctx, db); err != nil {
+		return err
+	}
+	if err := normalizeStoredLatencyColumns(ctx, db); err != nil {
+		return err
+	}
+	if err := ensureQuotaTriggerRunColumns(ctx, db); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (s *store) close() {
@@ -750,6 +778,355 @@ func (s *store) close() {
 		_ = s.db.Close()
 		s.db = nil
 	}
+}
+
+func withSQLiteAutoRepair[T any](ctx context.Context, s *store, operation string, fn func() (T, error)) (T, error) {
+	value, err := fn()
+	if !isSQLiteCorruptionError(err) {
+		return value, err
+	}
+	if repairErr := s.repairSQLiteDatabase(ctx); repairErr != nil {
+		var zero T
+		return zero, fmt.Errorf("%s failed with sqlite corruption (%w); automatic repair failed: %v", operation, err, repairErr)
+	}
+	value, retryErr := fn()
+	if retryErr != nil {
+		return value, fmt.Errorf("%s failed after automatic sqlite repair: %w", operation, retryErr)
+	}
+	return value, nil
+}
+
+func isSQLiteCorruptionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var sqliteErr sqlite3.Error
+	if errors.As(err, &sqliteErr) {
+		if sqliteErr.Code == sqlite3.ErrCorrupt || sqliteErr.Code == sqlite3.ErrNotADB {
+			return true
+		}
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "database disk image is malformed") ||
+		strings.Contains(text, "database schema is corrupt") ||
+		strings.Contains(text, "file is not a database") ||
+		(strings.Contains(text, "database") && strings.Contains(text, "malformed")) ||
+		(strings.Contains(text, "database") && strings.Contains(text, "corrupt"))
+}
+
+func (s *store) repairSQLiteDatabase(ctx context.Context) error {
+	s.repairMu.Lock()
+	defer s.repairMu.Unlock()
+	db, closeAfter, err := s.repairDBHandle()
+	if err != nil {
+		return err
+	}
+	if closeAfter {
+		defer db.Close()
+	}
+	if _, err := db.ExecContext(ctx, `PRAGMA busy_timeout=30000`); err != nil {
+		return err
+	}
+	if _, err := db.ExecContext(ctx, `REINDEX`); err != nil {
+		return err
+	}
+	problems, err := sqliteIntegrityProblems(ctx, db, 5)
+	if err != nil {
+		return err
+	}
+	if sqliteIntegrityOK(problems) {
+		return nil
+	}
+	if len(problems) == 0 {
+		return errors.New("integrity_check returned no rows after reindex")
+	}
+	return fmt.Errorf("integrity_check still reports: %s", strings.Join(problems, "; "))
+}
+
+func sqliteIntegrityProblems(ctx context.Context, db *sql.DB, limit int) ([]string, error) {
+	return sqliteCheckProblems(ctx, db, `PRAGMA integrity_check`, limit)
+}
+
+func sqliteQuickCheckProblems(ctx context.Context, db *sql.DB, limit int) ([]string, error) {
+	return sqliteCheckProblems(ctx, db, `PRAGMA quick_check`, limit)
+}
+
+func sqliteCheckProblems(ctx context.Context, db *sql.DB, query string, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = 1
+	}
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var problems []string
+	for rows.Next() {
+		var problem string
+		if err := rows.Scan(&problem); err != nil {
+			return nil, err
+		}
+		problems = append(problems, problem)
+		if len(problems) >= limit {
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return problems, nil
+}
+
+func sqliteIntegrityOK(problems []string) bool {
+	return len(problems) == 1 && strings.EqualFold(strings.TrimSpace(problems[0]), "ok")
+}
+
+func (s *store) repairDBHandle() (*sql.DB, bool, error) {
+	s.mu.Lock()
+	db := s.db
+	s.mu.Unlock()
+	if db != nil {
+		return db, false, nil
+	}
+	path, err := usageDBPath()
+	if err != nil {
+		return nil, false, err
+	}
+	db, err = openSQLiteDB(path)
+	if err != nil {
+		return nil, false, err
+	}
+	return db, true, nil
+}
+
+type dbHealthState struct {
+	Status               string `json:"status"`
+	LastCheckAt          string `json:"last_check_at,omitempty"`
+	LastRepairAt         string `json:"last_repair_at,omitempty"`
+	LastDurationMs       int64  `json:"last_duration_ms"`
+	LastError            string `json:"last_error,omitempty"`
+	LastQuickCheckResult string `json:"last_quick_check_result,omitempty"`
+	RepairCount          int64  `json:"repair_count"`
+}
+
+type dbHealthMonitor struct {
+	mu     sync.Mutex
+	cancel context.CancelFunc
+	state  dbHealthState
+}
+
+func (m *dbHealthMonitor) configure(cfg pluginConfig) {
+	m.mu.Lock()
+	if m.cancel != nil {
+		m.cancel()
+		m.cancel = nil
+	}
+	if m.state.Status == "" {
+		m.state.Status = "unknown"
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	m.cancel = cancel
+	m.mu.Unlock()
+	go m.loop(ctx)
+}
+
+func (m *dbHealthMonitor) stop() {
+	m.mu.Lock()
+	if m.cancel != nil {
+		m.cancel()
+		m.cancel = nil
+	}
+	m.mu.Unlock()
+}
+
+func (m *dbHealthMonitor) status() dbHealthState {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.state
+}
+
+func (m *dbHealthMonitor) loop(ctx context.Context) {
+	timer := time.NewTimer(30 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			m.run(ctx)
+			timer.Reset(dbHealthCheckInterval)
+		}
+	}
+}
+
+func (m *dbHealthMonitor) run(ctx context.Context) {
+	started := time.Now()
+	status := "ok"
+	var errText string
+	var quickResult string
+	repaired := false
+	db, closeAfter, err := globalStore.repairDBHandle()
+	if err != nil {
+		status = "error"
+		errText = sanitizeTriggerError(err)
+	} else {
+		if closeAfter {
+			defer db.Close()
+		}
+		problems, checkErr := sqliteQuickCheckProblems(ctx, db, 5)
+		quickResult = strings.Join(problems, "; ")
+		if checkErr != nil {
+			if isSQLiteCorruptionError(checkErr) {
+				repaired = true
+				if repairErr := globalStore.repairSQLiteDatabase(ctx); repairErr != nil {
+					status = "repair_failed"
+					errText = sanitizeTriggerError(repairErr)
+				}
+			} else {
+				status = "error"
+				errText = sanitizeTriggerError(checkErr)
+			}
+		} else if !sqliteIntegrityOK(problems) {
+			integrityProblems, integrityErr := sqliteIntegrityProblems(ctx, db, 5)
+			if integrityErr != nil {
+				status = "error"
+				errText = sanitizeTriggerError(integrityErr)
+			} else if !sqliteIntegrityOK(integrityProblems) {
+				repaired = true
+				if repairErr := globalStore.repairSQLiteDatabase(ctx); repairErr != nil {
+					status = "repair_failed"
+					errText = sanitizeTriggerError(repairErr)
+				}
+			}
+		}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.state.LastCheckAt = time.Now().Format(time.RFC3339)
+	m.state.LastDurationMs = time.Since(started).Milliseconds()
+	m.state.LastQuickCheckResult = quickResult
+	m.state.LastError = errText
+	m.state.Status = status
+	if repaired && errText == "" {
+		m.state.Status = "repaired"
+		m.state.LastRepairAt = time.Now().Format(time.RFC3339)
+		m.state.RepairCount++
+	}
+}
+
+type summaryMaintenanceState struct {
+	Running        bool   `json:"running"`
+	LastRunStarted string `json:"last_run_started_at,omitempty"`
+	LastRunAt      string `json:"last_run_at,omitempty"`
+	LastDurationMs int64  `json:"last_duration_ms"`
+	LastError      string `json:"last_error,omitempty"`
+}
+
+type summaryMaintenanceManager struct {
+	mu     sync.Mutex
+	cancel context.CancelFunc
+	state  summaryMaintenanceState
+}
+
+func (m *summaryMaintenanceManager) configure(cfg pluginConfig) {
+	m.mu.Lock()
+	if m.cancel != nil {
+		m.cancel()
+		m.cancel = nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	m.cancel = cancel
+	m.mu.Unlock()
+	go m.loop(ctx)
+}
+
+func (m *summaryMaintenanceManager) stop() {
+	m.mu.Lock()
+	if m.cancel != nil {
+		m.cancel()
+		m.cancel = nil
+	}
+	m.mu.Unlock()
+}
+
+func (m *summaryMaintenanceManager) status() summaryMaintenanceState {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.state
+}
+
+func (m *summaryMaintenanceManager) loop(ctx context.Context) {
+	m.run(ctx)
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m.run(ctx)
+		}
+	}
+}
+
+func (m *summaryMaintenanceManager) run(ctx context.Context) {
+	started := time.Now()
+	m.mu.Lock()
+	if m.state.Running {
+		m.mu.Unlock()
+		return
+	}
+	m.state.Running = true
+	m.state.LastRunStarted = started.Format(time.RFC3339)
+	m.mu.Unlock()
+	err := globalStore.runSummaryMaintenance(ctx)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.state.Running = false
+	m.state.LastRunAt = time.Now().Format(time.RFC3339)
+	m.state.LastDurationMs = time.Since(started).Milliseconds()
+	if err != nil && !errors.Is(err, context.Canceled) {
+		m.state.LastError = sanitizeTriggerError(err)
+	} else {
+		m.state.LastError = ""
+	}
+}
+
+func (s *store) runSummaryMaintenance(ctx context.Context) error {
+	_, err := withSQLiteAutoRepair(ctx, s, "summary maintenance", func() (struct{}, error) {
+		db, _, err := s.open(ctx)
+		if err != nil {
+			return struct{}{}, err
+		}
+		now := time.Now().Unix()
+		if err := backfillAutobansFromUsage(ctx, db, now); err != nil {
+			return struct{}{}, err
+		}
+		if err := backfillWorkspaceDeactivatedAuthsFromUsage(ctx, db); err != nil {
+			return struct{}{}, err
+		}
+		if err := backfillWorkspaceDeactivatedAuthsFromQuotaTriggerRuns(ctx, db); err != nil {
+			return struct{}{}, err
+		}
+		if err := expireAutobans(ctx, db, now); err != nil {
+			return struct{}{}, err
+		}
+		if err := reconcileAutobansWithQuotaSnapshots(ctx, db, now); err != nil {
+			return struct{}{}, err
+		}
+		if err := clearRecoveredAuthStatesFromUsage(ctx, db); err != nil {
+			return struct{}{}, err
+		}
+		if err := clearReplacedInvalidAuths(ctx, db); err != nil {
+			return struct{}{}, err
+		}
+		configuredAccounts := readConfiguredAuthAccounts()
+		if err := clearMissingConfiguredAuthState(ctx, db, configuredAccounts, configuredAuthDirectoryReadable()); err != nil {
+			return struct{}{}, err
+		}
+		return struct{}{}, nil
+	})
+	return err
 }
 
 func normalizeStoredResetColumns(ctx context.Context, db *sql.DB) error {
@@ -1975,6 +2352,12 @@ func classifyCodexBan(headers map[string][]string, primaryPct *float64, primaryR
 }
 
 func (s *store) pickAuth(ctx context.Context, req schedulerPickRequest) (schedulerPickResponse, error) {
+	return withSQLiteAutoRepair(ctx, s, "pick auth", func() (schedulerPickResponse, error) {
+		return s.pickAuthOnce(ctx, req)
+	})
+}
+
+func (s *store) pickAuthOnce(ctx context.Context, req schedulerPickRequest) (schedulerPickResponse, error) {
 	if !isCodexSchedulerRequest(req) {
 		return schedulerPickResponse{Handled: false}, nil
 	}

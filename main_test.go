@@ -16,6 +16,13 @@ import (
 	"time"
 )
 
+func runSummaryMaintenanceForTest(t *testing.T, ctx context.Context, store *store) {
+	t.Helper()
+	if err := store.runSummaryMaintenance(ctx); err != nil {
+		t.Fatalf("summary maintenance returned error: %v", err)
+	}
+}
+
 func TestResourceRoutesExposeOnlyStaticDashboard(t *testing.T) {
 	raw, err := handleMethod("management.register", nil)
 	if err != nil {
@@ -161,6 +168,7 @@ func TestDashboardHasClickableInvalidAuthCardAndManagementModal(t *testing.T) {
 		`data-oauth-copy`,
 		`复制授权链接`,
 		`body:JSON.stringify({names:names})`,
+		`await load(true,true);`,
 	} {
 		if !strings.Contains(dashboardHTML, snippet) {
 			t.Fatalf("dashboardHTML missing invalid auth management snippet %q", snippet)
@@ -199,6 +207,7 @@ func TestDashboardHasWorkspaceDeactivatedCardAndDeleteOnlyModal(t *testing.T) {
 		`function deleteAllWorkspaceDeactivatedAuths()`,
 		`function deleteSelectedWorkspaceDeactivatedAuths()`,
 		`body:JSON.stringify({names:names})`,
+		`await load(true,true);`,
 	} {
 		if !strings.Contains(dashboardHTML, snippet) {
 			t.Fatalf("dashboardHTML missing workspace deactivated management snippet %q", snippet)
@@ -314,6 +323,57 @@ func TestSanitizeTriggerErrorKeepsErrorText(t *testing.T) {
 	}
 }
 
+func TestSQLiteAutoRepairRetriesAfterMalformedError(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+	if _, _, err := store.open(ctx); err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	attempts := 0
+	got, err := withSQLiteAutoRepair(ctx, store, "test operation", func() (string, error) {
+		attempts++
+		if attempts == 1 {
+			return "", errors.New("database disk image is malformed")
+		}
+		return "ok", nil
+	})
+	if err != nil {
+		t.Fatalf("withSQLiteAutoRepair returned error: %v", err)
+	}
+	if got != "ok" || attempts != 2 {
+		t.Fatalf("result = %q attempts = %d, want ok after one retry", got, attempts)
+	}
+}
+
+func TestSQLiteAutoRepairDoesNotRetryOrdinaryErrors(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+	attempts := 0
+	_, err := withSQLiteAutoRepair(ctx, store, "test operation", func() (string, error) {
+		attempts++
+		return "", errors.New("database is locked")
+	})
+	if err == nil {
+		t.Fatalf("withSQLiteAutoRepair returned nil error for ordinary failure")
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want no retry for ordinary failure", attempts)
+	}
+}
+
+func TestIsSQLiteCorruptionErrorRecognizesMalformedDatabase(t *testing.T) {
+	if !isSQLiteCorruptionError(errors.New("database disk image is malformed")) {
+		t.Fatalf("malformed database error was not recognized as repairable corruption")
+	}
+	if isSQLiteCorruptionError(errors.New("database is locked")) {
+		t.Fatalf("ordinary sqlite busy error was recognized as corruption")
+	}
+}
+
 func TestCodex429AutobanFiltersSchedulerCandidate(t *testing.T) {
 	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
 	ctx := context.Background()
@@ -417,8 +477,8 @@ func TestCodex429AutobanFiltersSchedulerCandidateByNormalizedAlias(t *testing.T)
 		t.Fatalf("summary returned error: %v", err)
 	}
 	diagnostics := data["diagnostics"].(diagnosticsSummary)
-	if diagnostics.Scheduler.ActiveBanCount != 0 || diagnostics.Scheduler.FilteredCandidates != 1 || diagnostics.Scheduler.UnmatchedActiveBans != 0 || diagnostics.Scheduler.LastFilteredAt == "" {
-		t.Fatalf("scheduler diagnostics = %+v, want missing-file ban cleaned after one candidate was filtered", diagnostics.Scheduler)
+	if diagnostics.Scheduler.ActiveBanCount != 1 || diagnostics.Scheduler.FilteredCandidates != 1 || diagnostics.Scheduler.UnmatchedActiveBans != 0 || diagnostics.Scheduler.LastFilteredAt == "" {
+		t.Fatalf("scheduler diagnostics = %+v, want one candidate filtered by the active ban seen during pickAuth", diagnostics.Scheduler)
 	}
 }
 
@@ -866,6 +926,7 @@ func TestCodex402DeactivatedWorkspaceFiltersUntilAuthFileDeletedOrReplaced(t *te
 	if err := os.Chtimes(authFile, newMod, newMod); err != nil {
 		t.Fatalf("chtimes new auth file: %v", err)
 	}
+	runSummaryMaintenanceForTest(t, ctx, store)
 	data, err = store.summary(ctx, "24h", 10)
 	if err != nil {
 		t.Fatalf("summary after replace returned error: %v", err)
@@ -1151,6 +1212,7 @@ func TestSummaryBackfillsWorkspaceDeactivatedFromHistoricalBodylessUsage402(t *t
 		t.Fatalf("insert historical usage event: %v", err)
 	}
 
+	runSummaryMaintenanceForTest(t, ctx, store)
 	data, err := store.summary(ctx, "24h", 10)
 	if err != nil {
 		t.Fatalf("summary returned error: %v", err)
@@ -1381,6 +1443,7 @@ INSERT INTO invalid_auths (
 		t.Fatalf("insert successful usage: %v", err)
 	}
 
+	runSummaryMaintenanceForTest(t, ctx, store)
 	data, err := store.summary(ctx, "24h", 10)
 	if err != nil {
 		t.Fatalf("summary returned error: %v", err)
@@ -1525,6 +1588,7 @@ INSERT INTO autoban_bans (
 		t.Fatalf("insert successful usage: %v", err)
 	}
 
+	runSummaryMaintenanceForTest(t, ctx, store)
 	data, err := store.summary(ctx, "24h", 10)
 	if err != nil {
 		t.Fatalf("summary returned error: %v", err)
@@ -1621,6 +1685,7 @@ func TestSummaryHidesDeletedConfiguredCodexAccounts(t *testing.T) {
 		t.Fatalf("recordUsage deleted returned error: %v", err)
 	}
 
+	runSummaryMaintenanceForTest(t, ctx, store)
 	data, err := store.summary(ctx, "24h", 10)
 	if err != nil {
 		t.Fatalf("summary returned error: %v", err)
@@ -1734,6 +1799,7 @@ func TestSummaryClearsDeletedConfiguredAuthState(t *testing.T) {
 		t.Fatalf("recordUsage deleted 401 returned error: %v", err)
 	}
 
+	runSummaryMaintenanceForTest(t, ctx, store)
 	data, err := store.summary(ctx, "24h", 10)
 	if err != nil {
 		t.Fatalf("summary returned error: %v", err)
@@ -1772,6 +1838,7 @@ INSERT INTO invalid_auths (
 		t.Fatalf("insert invalid auth: %v", err)
 	}
 
+	runSummaryMaintenanceForTest(t, ctx, store)
 	data, err := store.summary(ctx, "24h", 20)
 	if err != nil {
 		t.Fatalf("summary returned error: %v", err)
@@ -1812,6 +1879,7 @@ INSERT INTO invalid_auths (
 		t.Fatalf("insert legacy invalid auth: %v", err)
 	}
 
+	runSummaryMaintenanceForTest(t, ctx, store)
 	data, err := store.summary(ctx, "24h", 20)
 	if err != nil {
 		t.Fatalf("summary returned error: %v", err)
@@ -2337,26 +2405,37 @@ func TestSummaryPrecomputeCacheReturnsCachedData(t *testing.T) {
 	}
 }
 
-func TestSummaryPrecomputeForceRefreshBypassesStaleAuthFileCache(t *testing.T) {
+func TestDefaultSummaryPrecomputeKeysCoverDashboardWindows(t *testing.T) {
+	keys := map[summaryCacheKey]bool{}
+	for _, key := range defaultSummaryPrecomputeKeys() {
+		keys[normalizeSummaryCacheKey(key)] = true
+	}
+	for _, key := range []summaryCacheKey{
+		{Window: "24h", Limit: 2000},
+		{Window: "7d", Limit: 2000},
+		{Window: "30d", Limit: 2000},
+	} {
+		key = normalizeSummaryCacheKey(key)
+		if !keys[key] {
+			t.Fatalf("defaultSummaryPrecomputeKeys missing %#v; keys=%#v", key, keys)
+		}
+	}
+}
+
+func TestSummaryPrecomputeForceRefreshReturnsCachedDataAndRefreshesAsync(t *testing.T) {
 	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
-	authDir := t.TempDir()
-	t.Setenv("CPA_AUTH_DIR", authDir)
+	t.Setenv("CPA_AUTH_DIR", t.TempDir())
 	ctx := context.Background()
 	store := &store{}
 	defer store.close()
 
-	authFile := filepath.Join(authDir, "stale-delete@example.com.json")
-	if err := os.WriteFile(authFile, []byte(`{"email":"stale-delete@example.com","type":"codex","access_token":"secret"}`), 0600); err != nil {
-		t.Fatalf("write auth file: %v", err)
-	}
 	if err := store.recordUsage(ctx, usageRecord{
 		Provider:    "codex",
-		AuthID:      "stale-delete@example.com.json",
-		AuthIndex:   "stale-delete@example.com.json",
-		Source:      "stale-delete@example.com",
+		AuthID:      "async-refresh@example.com",
+		AuthIndex:   "async-refresh",
+		Source:      "async-refresh@example.com",
 		RequestedAt: time.Now(),
-		Failed:      true,
-		Failure:     usageFailure{StatusCode: http.StatusUnauthorized},
+		Detail:      usageDetail{TotalTokens: 100},
 	}); err != nil {
 		t.Fatalf("recordUsage returned error: %v", err)
 	}
@@ -2364,29 +2443,132 @@ func TestSummaryPrecomputeForceRefreshBypassesStaleAuthFileCache(t *testing.T) {
 	cfg := normalizePluginConfig(defaultPluginConfig())
 	cfg.SummaryPrecomputeEnabled = true
 	cfg.SummaryPrecomputeIntervalSeconds = 60
-	if err := manager.refresh(ctx, store, cfg, []summaryCacheKey{{Window: "all", Limit: 10}}); err != nil {
+	if err := manager.refresh(ctx, store, cfg, []summaryCacheKey{{Window: "24h", Limit: 10}}); err != nil {
 		t.Fatalf("precompute refresh returned error: %v", err)
+	}
+	if err := store.recordUsage(ctx, usageRecord{
+		Provider:    "codex",
+		AuthID:      "async-refresh@example.com",
+		AuthIndex:   "async-refresh",
+		Source:      "async-refresh@example.com",
+		RequestedAt: time.Now(),
+		Detail:      usageDetail{TotalTokens: 23},
+	}); err != nil {
+		t.Fatalf("recordUsage second event returned error: %v", err)
+	}
+	fresh, err := manager.summaryFresh(ctx, store, "24h", 10)
+	if err != nil {
+		t.Fatalf("fresh summary returned error: %v", err)
+	}
+	accounts := fresh["accounts"].([]accountRow)
+	if len(accounts) != 1 || accounts[0].TotalTokens != 100 {
+		t.Fatalf("fresh cached accounts = %#v, want immediate cached 100 tokens", accounts)
+	}
+	info, ok := fresh["precompute"].(summaryPrecomputeInfo)
+	if !ok || !info.Hit || info.Synchronous {
+		t.Fatalf("fresh precompute info = %#v, want cached async refresh response", fresh["precompute"])
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		data, ok := manager.cached("24h", 10, cfg)
+		if ok {
+			accounts := data["accounts"].([]accountRow)
+			if len(accounts) == 1 && accounts[0].TotalTokens == 123 {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("precompute cache did not refresh to 123 tokens before timeout")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestManagementSummarySyncRefreshRunsMaintenanceAndBypassesCachedInvalidAuths(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	authDir := t.TempDir()
+	t.Setenv("CPA_AUTH_DIR", authDir)
+
+	previousStore := globalStore
+	previousPrecomputer := globalSummaryPrecomputer
+	previousMaintenance := globalSummaryMaintenance
+	previousHealth := globalDBHealth
+	globalStore = &store{}
+	globalSummaryPrecomputer = &summaryPrecomputeManager{}
+	globalSummaryMaintenance = &summaryMaintenanceManager{}
+	globalDBHealth = &dbHealthMonitor{}
+	t.Cleanup(func() {
+		globalStore.close()
+		globalSummaryPrecomputer.stop()
+		globalSummaryMaintenance.stop()
+		globalDBHealth.stop()
+		globalStore = previousStore
+		globalSummaryPrecomputer = previousPrecomputer
+		globalSummaryMaintenance = previousMaintenance
+		globalDBHealth = previousHealth
+	})
+
+	ctx := context.Background()
+	authFile := filepath.Join(authDir, "sync-delete@example.com.json")
+	if err := os.WriteFile(authFile, []byte(`{"email":"sync-delete@example.com","type":"codex","access_token":"secret"}`), 0600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+	if err := globalStore.recordUsage(ctx, usageRecord{
+		Provider:    "codex",
+		AuthID:      "sync-delete@example.com.json",
+		AuthIndex:   "sync-delete@example.com.json",
+		Source:      "sync-delete@example.com",
+		RequestedAt: time.Now(),
+		Failed:      true,
+		Failure:     usageFailure{StatusCode: http.StatusUnauthorized},
+	}); err != nil {
+		t.Fatalf("record usage: %v", err)
+	}
+
+	cfg := normalizePluginConfig(defaultPluginConfig())
+	cfg.SummaryPrecomputeEnabled = true
+	cfg.SummaryPrecomputeIntervalSeconds = 60
+	globalSummaryPrecomputer.mu.Lock()
+	globalSummaryPrecomputer.cfg = cfg
+	globalSummaryPrecomputer.entries = map[summaryCacheKey]summaryCacheEntry{}
+	globalSummaryPrecomputer.refreshing = map[summaryCacheKey]bool{}
+	globalSummaryPrecomputer.mu.Unlock()
+	if err := globalSummaryPrecomputer.refresh(ctx, globalStore, cfg, []summaryCacheKey{{Window: "all", Limit: 10}}); err != nil {
+		t.Fatalf("precompute refresh: %v", err)
 	}
 	if err := os.Remove(authFile); err != nil {
 		t.Fatalf("remove auth file: %v", err)
 	}
-	cached, err := manager.summary(ctx, store, "all", 10)
-	if err != nil {
-		t.Fatalf("cached summary returned error: %v", err)
+
+	resp := handleManagement(managementRequest{
+		Path: "/v0/management/plugins/codex-token-usage/summary",
+		Query: map[string][]string{
+			"window":  {"all"},
+			"limit":   {"10"},
+			"refresh": {"1"},
+			"sync":    {"1"},
+		},
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("summary status = %d body=%s", resp.StatusCode, string(resp.Body))
 	}
-	if got := cached["invalid_auths"].([]invalidAuthRow); len(got) != 1 {
-		t.Fatalf("cached invalid_auths = %#v, want stale cached row before force refresh", got)
+	var data map[string]json.RawMessage
+	if err := json.Unmarshal(resp.Body, &data); err != nil {
+		t.Fatalf("unmarshal summary: %v", err)
 	}
-	fresh, err := manager.summaryFresh(ctx, store, "all", 10)
-	if err != nil {
-		t.Fatalf("fresh summary returned error: %v", err)
+	var invalids []invalidAuthRow
+	if err := json.Unmarshal(data["invalid_auths"], &invalids); err != nil {
+		t.Fatalf("unmarshal invalid_auths: %v", err)
 	}
-	if got := fresh["invalid_auths"].([]invalidAuthRow); len(got) != 0 {
-		t.Fatalf("fresh invalid_auths = %#v, want deleted auth file removed", got)
+	if len(invalids) != 0 {
+		t.Fatalf("invalid_auths = %#v, want sync refresh to clear deleted auth file", invalids)
 	}
-	info, ok := fresh["precompute"].(summaryPrecomputeInfo)
-	if !ok || info.Hit || !info.Synchronous {
-		t.Fatalf("fresh precompute info = %#v, want synchronous cache bypass", fresh["precompute"])
+	var info summaryPrecomputeInfo
+	if err := json.Unmarshal(data["precompute"], &info); err != nil {
+		t.Fatalf("unmarshal precompute info: %v", err)
+	}
+	if info.Hit || !info.Synchronous {
+		t.Fatalf("precompute info = %+v, want synchronous cache bypass", info)
 	}
 }
 

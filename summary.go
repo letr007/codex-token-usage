@@ -42,10 +42,11 @@ type summaryCacheEntry struct {
 }
 
 type summaryPrecomputeManager struct {
-	mu      sync.Mutex
-	cfg     pluginConfig
-	cancel  context.CancelFunc
-	entries map[summaryCacheKey]summaryCacheEntry
+	mu         sync.Mutex
+	cfg        pluginConfig
+	cancel     context.CancelFunc
+	entries    map[summaryCacheKey]summaryCacheEntry
+	refreshing map[summaryCacheKey]bool
 }
 
 func (m *summaryPrecomputeManager) configure(cfg pluginConfig) {
@@ -57,6 +58,9 @@ func (m *summaryPrecomputeManager) configure(cfg pluginConfig) {
 	m.cfg = cfg
 	if m.entries == nil {
 		m.entries = map[summaryCacheKey]summaryCacheEntry{}
+	}
+	if m.refreshing == nil {
+		m.refreshing = map[summaryCacheKey]bool{}
 	}
 	if !cfg.SummaryPrecomputeEnabled {
 		m.mu.Unlock()
@@ -93,6 +97,9 @@ func (m *summaryPrecomputeManager) loop(ctx context.Context, cfg pluginConfig) {
 
 func defaultSummaryPrecomputeKeys() []summaryCacheKey {
 	return []summaryCacheKey{
+		{Window: "24h", Limit: 2000},
+		{Window: "7d", Limit: 2000},
+		{Window: "30d", Limit: 2000},
 		{Window: "24h", Limit: 100},
 		{Window: "24h", Limit: 500},
 		{Window: "all", Limit: 500},
@@ -105,6 +112,7 @@ func (m *summaryPrecomputeManager) refresh(ctx context.Context, store *store, cf
 	}
 	var firstErr error
 	for _, key := range keys {
+		key = normalizeSummaryCacheKey(key)
 		started := time.Now()
 		data, err := store.summary(ctx, key.Window, key.Limit)
 		durationMs := time.Since(started).Milliseconds()
@@ -118,28 +126,43 @@ func (m *summaryPrecomputeManager) refresh(ctx context.Context, store *store, cf
 			if firstErr == nil {
 				firstErr = err
 			}
+			m.mu.Lock()
+			if m.entries == nil {
+				m.entries = map[summaryCacheKey]summaryCacheEntry{}
+			}
+			if previous, ok := m.entries[key]; ok && previous.data != nil {
+				previous.err = entry.err
+				m.entries[key] = previous
+			} else {
+				m.entries[key] = entry
+			}
+			m.mu.Unlock()
+			continue
 		}
 		m.mu.Lock()
 		if m.entries == nil {
 			m.entries = map[summaryCacheKey]summaryCacheEntry{}
 		}
-		m.entries[normalizeSummaryCacheKey(key)] = entry
+		m.entries[key] = entry
 		m.mu.Unlock()
 	}
 	return firstErr
 }
 
 func (m *summaryPrecomputeManager) summary(ctx context.Context, store *store, window string, limit int) (map[string]any, error) {
+	requestStarted := time.Now()
 	cfg := m.config()
 	if !cfg.SummaryPrecomputeEnabled {
 		data, err := store.summary(ctx, window, limit)
 		if err == nil {
 			data = cloneSummaryMap(data)
 			data["precompute"] = summaryPrecomputeInfo{Enabled: false, Window: window, Limit: limit}
+			attachSummaryRuntimeInfo(data, time.Since(requestStarted).Milliseconds())
 		}
 		return data, err
 	}
 	if data, ok := m.cached(window, limit, cfg); ok {
+		attachSummaryRuntimeInfo(data, time.Since(requestStarted).Milliseconds())
 		return data, nil
 	}
 	key := normalizeSummaryCacheKey(summaryCacheKey{Window: window, Limit: limit})
@@ -167,12 +190,32 @@ func (m *summaryPrecomputeManager) summary(ctx context.Context, store *store, wi
 		Precomputed:  false,
 		Synchronous:  true,
 	}
+	attachSummaryRuntimeInfo(out, time.Since(requestStarted).Milliseconds())
 	return out, nil
 }
 
 func (m *summaryPrecomputeManager) summaryFresh(ctx context.Context, store *store, window string, limit int) (map[string]any, error) {
+	requestStarted := time.Now()
 	cfg := m.config()
 	key := normalizeSummaryCacheKey(summaryCacheKey{Window: window, Limit: limit})
+	if cfg.SummaryPrecomputeEnabled {
+		if data, ok := m.cachedAny(key, cfg); ok {
+			m.refreshAsync(store, cfg, key)
+			attachSummaryRuntimeInfo(data, time.Since(requestStarted).Milliseconds())
+			return data, nil
+		}
+	}
+	return m.summarySyncWithStarted(ctx, store, cfg, key, requestStarted)
+}
+
+func (m *summaryPrecomputeManager) summarySync(ctx context.Context, store *store, window string, limit int) (map[string]any, error) {
+	cfg := m.config()
+	key := normalizeSummaryCacheKey(summaryCacheKey{Window: window, Limit: limit})
+	return m.summarySyncWithStarted(ctx, store, cfg, key, time.Now())
+}
+
+func (m *summaryPrecomputeManager) summarySyncWithStarted(ctx context.Context, store *store, cfg pluginConfig, key summaryCacheKey, requestStarted time.Time) (map[string]any, error) {
+	key = normalizeSummaryCacheKey(key)
 	started := time.Now()
 	data, err := store.summary(ctx, key.Window, key.Limit)
 	durationMs := time.Since(started).Milliseconds()
@@ -197,7 +240,33 @@ func (m *summaryPrecomputeManager) summaryFresh(ctx context.Context, store *stor
 		Precomputed:  false,
 		Synchronous:  true,
 	}
+	attachSummaryRuntimeInfo(out, time.Since(requestStarted).Milliseconds())
 	return out, nil
+}
+
+func (m *summaryPrecomputeManager) refreshAsync(store *store, cfg pluginConfig, key summaryCacheKey) {
+	if !cfg.SummaryPrecomputeEnabled {
+		return
+	}
+	key = normalizeSummaryCacheKey(key)
+	m.mu.Lock()
+	if m.refreshing == nil {
+		m.refreshing = map[summaryCacheKey]bool{}
+	}
+	if m.refreshing[key] {
+		m.mu.Unlock()
+		return
+	}
+	m.refreshing[key] = true
+	m.mu.Unlock()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		_ = m.refresh(ctx, store, cfg, []summaryCacheKey{key})
+		m.mu.Lock()
+		delete(m.refreshing, key)
+		m.mu.Unlock()
+	}()
 }
 
 func (m *summaryPrecomputeManager) cached(window string, limit int, cfg pluginConfig) (map[string]any, bool) {
@@ -205,7 +274,7 @@ func (m *summaryPrecomputeManager) cached(window string, limit int, cfg pluginCo
 	m.mu.Lock()
 	entry, ok := m.entries[key]
 	m.mu.Unlock()
-	if !ok || entry.data == nil || entry.err != "" {
+	if !ok || entry.data == nil {
 		return nil, false
 	}
 	ttl := time.Duration(maxInt(cfg.SummaryPrecomputeIntervalSeconds*2, 10)) * time.Second
@@ -213,20 +282,18 @@ func (m *summaryPrecomputeManager) cached(window string, limit int, cfg pluginCo
 	if age > ttl {
 		return nil, false
 	}
-	out := cloneSummaryMap(entry.data)
-	out["precompute"] = summaryPrecomputeInfo{
-		Enabled:      true,
-		Hit:          true,
-		Window:       key.Window,
-		Limit:        key.Limit,
-		CachedAt:     entry.cachedAt.Format(time.RFC3339),
-		AgeSeconds:   int64(age.Seconds()),
-		DurationMs:   entry.durationMs,
-		IntervalSecs: cfg.SummaryPrecomputeIntervalSeconds,
-		LastError:    entry.err,
-		Precomputed:  true,
+	return cloneCachedSummary(entry, key, cfg, age), true
+}
+
+func (m *summaryPrecomputeManager) cachedAny(key summaryCacheKey, cfg pluginConfig) (map[string]any, bool) {
+	key = normalizeSummaryCacheKey(key)
+	m.mu.Lock()
+	entry, ok := m.entries[key]
+	m.mu.Unlock()
+	if !ok || entry.data == nil {
+		return nil, false
 	}
-	return out, true
+	return cloneCachedSummary(entry, key, cfg, time.Since(entry.cachedAt)), true
 }
 
 func (m *summaryPrecomputeManager) config() pluginConfig {
@@ -250,14 +317,57 @@ func normalizeSummaryCacheKey(key summaryCacheKey) summaryCacheKey {
 }
 
 func cloneSummaryMap(data map[string]any) map[string]any {
-	out := make(map[string]any, len(data)+1)
+	out := make(map[string]any, len(data)+8)
 	for key, value := range data {
 		out[key] = value
 	}
 	return out
 }
 
+func cloneCachedSummary(entry summaryCacheEntry, key summaryCacheKey, cfg pluginConfig, age time.Duration) map[string]any {
+	out := cloneSummaryMap(entry.data)
+	out["precompute"] = summaryPrecomputeInfo{
+		Enabled:      true,
+		Hit:          true,
+		Window:       key.Window,
+		Limit:        key.Limit,
+		CachedAt:     entry.cachedAt.Format(time.RFC3339),
+		AgeSeconds:   int64(age.Seconds()),
+		DurationMs:   entry.durationMs,
+		IntervalSecs: cfg.SummaryPrecomputeIntervalSeconds,
+		LastError:    entry.err,
+		Precomputed:  true,
+		Synchronous:  false,
+	}
+	return out
+}
+
+func attachSummaryRuntimeInfo(data map[string]any, durationMs int64) {
+	if data == nil {
+		return
+	}
+	if durationMs >= 0 {
+		data["duration_ms"] = durationMs
+	}
+	maintenance := globalSummaryMaintenance.status()
+	dbHealth := globalDBHealth.status()
+	data["maintenance_last_run_at"] = maintenance.LastRunAt
+	data["db_health_last_check_at"] = dbHealth.LastCheckAt
+	data["db_health_status"] = firstNonEmptyString(dbHealth.Status, "unknown")
+}
+
 func (s *store) summary(ctx context.Context, window string, limit int) (map[string]any, error) {
+	started := time.Now()
+	data, err := withSQLiteAutoRepair(ctx, s, "summary", func() (map[string]any, error) {
+		return s.summaryOnce(ctx, window, limit)
+	})
+	if err == nil {
+		attachSummaryRuntimeInfo(data, time.Since(started).Milliseconds())
+	}
+	return data, err
+}
+
+func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[string]any, error) {
 	db, path, err := s.open(ctx)
 	if err != nil {
 		return nil, err
@@ -279,28 +389,7 @@ func (s *store) summary(ctx context.Context, window string, limit int) (map[stri
 		return nil, err
 	}
 	now := time.Now().Unix()
-	if err := backfillAutobansFromUsage(ctx, db, now); err != nil {
-		return nil, err
-	}
-	if err := backfillWorkspaceDeactivatedAuthsFromUsage(ctx, db); err != nil {
-		return nil, err
-	}
-	if err := backfillWorkspaceDeactivatedAuthsFromQuotaTriggerRuns(ctx, db); err != nil {
-		return nil, err
-	}
-	if err := expireAutobans(ctx, db, now); err != nil {
-		return nil, err
-	}
-	if err := reconcileAutobansWithQuotaSnapshots(ctx, db, now); err != nil {
-		return nil, err
-	}
-	if err := clearRecoveredAuthStatesFromUsage(ctx, db); err != nil {
-		return nil, err
-	}
 	authDirReadable := configuredAuthDirectoryReadable()
-	if err := clearReplacedInvalidAuths(ctx, db); err != nil {
-		return nil, err
-	}
 	accounts, err := queryAccounts(ctx, db, since, limit)
 	if err != nil {
 		return nil, err
@@ -311,9 +400,6 @@ func (s *store) summary(ctx context.Context, window string, limit int) (map[stri
 	configuredAccounts := readConfiguredAuthAccounts()
 	accounts = mergeConfiguredAccounts(accounts, configuredAccounts)
 	accounts = filterCurrentConfiguredAccounts(accounts, configuredAccounts, authDirReadable)
-	if err := clearMissingConfiguredAuthState(ctx, db, configuredAccounts, authDirReadable); err != nil {
-		return nil, err
-	}
 	quotaSince := time.Now().Add(-35 * 24 * time.Hour).Unix()
 	applyLatestQuotaSnapshots(ctx, db, accounts, quotaSince)
 	applySecondaryQuotaEstimates(ctx, db, accounts, &totals, quotaSince)
@@ -383,7 +469,7 @@ func (s *store) summary(ctx context.Context, window string, limit int) (map[stri
 	if err != nil {
 		return nil, err
 	}
-	autobans = clearAndFilterMissingAutobanRows(ctx, db, autobans, configuredAccounts, authDirReadable)
+	autobans = filterMissingAutobanRows(autobans, configuredAccounts, authDirReadable)
 	autobans = mergeEffectiveAutobans(autobans, invalidAuths)
 	applyAccountQuotaToAutobans(autobans, accounts)
 	diagnostics := buildDiagnostics(ctx, db, path, accounts, providers, unauthorizedInvalidAuths, autobans, externalUseAlerts)
@@ -418,7 +504,7 @@ func (s *store) summary(ctx context.Context, window string, limit int) (map[stri
 	return result, nil
 }
 
-func clearAndFilterMissingAutobanRows(ctx context.Context, db *sql.DB, rows []autobanRow, configured []configuredAccount, authDirReadable bool) []autobanRow {
+func filterMissingAutobanRows(rows []autobanRow, configured []configuredAccount, authDirReadable bool) []autobanRow {
 	if !authDirReadable || len(configured) == 0 || len(rows) == 0 {
 		return rows
 	}
@@ -430,8 +516,6 @@ func clearAndFilterMissingAutobanRows(ctx context.Context, db *sql.DB, rows []au
 		if len(cleanupAliases) > 0 {
 			if aliasesContainAny(strictAliases, cleanupAliases...) {
 				out = append(out, row)
-			} else {
-				_, _ = db.ExecContext(ctx, `UPDATE autoban_bans SET active=0 WHERE active=1 AND auth_id=?`, row.AuthID)
 			}
 			continue
 		}
@@ -439,8 +523,6 @@ func clearAndFilterMissingAutobanRows(ctx context.Context, db *sql.DB, rows []au
 		if len(rowStrictAliases) > 0 {
 			if aliasesContainAny(strictAliases, rowStrictAliases...) {
 				out = append(out, row)
-			} else {
-				_, _ = db.ExecContext(ctx, `UPDATE autoban_bans SET active=0 WHERE active=1 AND auth_id=?`, row.AuthID)
 			}
 			continue
 		}
@@ -448,7 +530,6 @@ func clearAndFilterMissingAutobanRows(ctx context.Context, db *sql.DB, rows []au
 			out = append(out, row)
 			continue
 		}
-		_, _ = db.ExecContext(ctx, `UPDATE autoban_bans SET active=0 WHERE active=1 AND auth_id=?`, row.AuthID)
 	}
 	return out
 }

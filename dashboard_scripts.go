@@ -212,7 +212,7 @@ function initInvalidAuthControl(){
   document.getElementById('invalid-auth-card').onclick=openInvalidAuthModal;
   document.getElementById('invalid-auth-close').onclick=closeInvalidAuthModal;
   document.getElementById('invalid-auth-close-bottom').onclick=closeInvalidAuthModal;
-  document.getElementById('invalid-auth-refresh').onclick=async()=>{setInvalidAuthStatus('正在刷新 401 账号...','');await load(true);renderInvalidAuthModal()};
+  document.getElementById('invalid-auth-refresh').onclick=async()=>{setInvalidAuthStatus('正在刷新 401 账号...','');await load(true,true);renderInvalidAuthModal()};
   document.getElementById('invalid-auth-delete-all').onclick=deleteAllInvalidAuths;
   document.getElementById('invalid-auth-select-page').onclick=selectCurrentInvalidAuthPage;
   document.getElementById('invalid-auth-delete-selected').onclick=deleteSelectedInvalidAuths;
@@ -227,7 +227,7 @@ function initWorkspaceDeactivatedControl(){
   document.getElementById('workspace-deactivated-card').onclick=openWorkspaceDeactivatedModal;
   document.getElementById('workspace-deactivated-close').onclick=closeWorkspaceDeactivatedModal;
   document.getElementById('workspace-deactivated-close-bottom').onclick=closeWorkspaceDeactivatedModal;
-  document.getElementById('workspace-deactivated-refresh').onclick=async()=>{setWorkspaceDeactivatedStatus('正在刷新 402 账号...','');await load(true);renderWorkspaceDeactivatedModal()};
+  document.getElementById('workspace-deactivated-refresh').onclick=async()=>{setWorkspaceDeactivatedStatus('正在刷新 402 账号...','');await load(true,true);renderWorkspaceDeactivatedModal()};
   document.getElementById('workspace-deactivated-delete-all').onclick=deleteAllWorkspaceDeactivatedAuths;
   document.getElementById('workspace-deactivated-select-page').onclick=selectCurrentWorkspaceDeactivatedPage;
   document.getElementById('workspace-deactivated-delete-selected').onclick=deleteSelectedWorkspaceDeactivatedAuths;
@@ -657,7 +657,7 @@ async function deleteInvalidAuthRows(rows,confirmText,runningText){
     invalidAuthSelected.clear();
     removeAuthFilesFromCurrentData(names);
     renderInvalidAuthModal();
-    await load(true);
+    await load(true,true);
     setAuthDeleteBusy('invalid-auth',false);
     renderInvalidAuthModal();
     setInvalidAuthStatus('删除成功，统计已刷新。','ok');
@@ -688,7 +688,7 @@ async function deleteWorkspaceDeactivatedRows(rows,confirmText,runningText){
     workspaceDeactivatedSelected.clear();
     removeAuthFilesFromCurrentData(names);
     renderWorkspaceDeactivatedModal();
-    await load(true);
+    await load(true,true);
     setAuthDeleteBusy('workspace-deactivated',false);
     renderWorkspaceDeactivatedModal();
     setWorkspaceDeactivatedStatus('删除成功，统计已刷新。','ok');
@@ -1478,21 +1478,21 @@ function perfCell(r){
 }
 function tierText(v){v=String(v||'').trim(); if(!v)return ''; const lower=v.toLowerCase(); if(lower==='default'||lower==='standard')return ''; if(lower==='priority')return '优先'; if(lower==='flex')return '弹性'; return v}
 function requestStatusText(r){const code=Number(r.status_code||0)||((r.failed||false)?599:200); return (r.failed?('失败 '+code):('HTTP '+code))}
-async function load(forceRefresh=false){
+async function load(forceRefresh=false,syncRefresh=false){
   if(loading)return;
   loading=true;
   const key=managementKey(); if(key)safeStorageSet(safeSessionStorage(),'cpa_token_usage_key',key);
   const win=document.getElementById('window').value;
   const st=document.getElementById('status'); st.textContent=tr('加载中...');
   try{
-    lastData=await fetchSummary(win,key,forceRefresh);
+    lastData=await fetchSummary(win,key,forceRefresh,syncRefresh);
     renderAll();
     st.textContent=tr('窗口：')+lastData.window+' · '+tr('数据库：')+lastData.db_path+' · '+tr('更新时间：')+lastData.generated_at+' · '+tr('管理接口');
   }catch(e){st.textContent=tr('失败')+': '+tr(e.message)}
   finally{loading=false}
 }
-async function fetchSummary(win,key,forceRefresh=false){
-  const url='?window='+encodeURIComponent(win)+'&limit=2000'+(forceRefresh?'&refresh=1':'');
+async function fetchSummary(win,key,forceRefresh=false,syncRefresh=false){
+  const url='?window='+encodeURIComponent(win)+'&limit=2000'+(forceRefresh?'&refresh=1':'')+(syncRefresh?'&sync=1':'');
   if(!key){showFallbackKeyInput();throw new Error('请填写备用 CPA 管理密钥后刷新。')}
   keyEl.classList.remove('on');
   const res=await fetch(managementApi+url,{headers:{Authorization:'Bearer '+key,Accept:'application/json'}});
