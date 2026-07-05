@@ -63,6 +63,50 @@ LIMIT ?`
 		return nil, err
 	}
 	defer rows.Close()
+	return scanRecentRows(rows, prices)
+}
+
+func queryProviderRecent(ctx context.Context, db *sql.DB, since int64, perProvider, limit int, prices map[string]modelPrice) ([]recentRow, error) {
+	if perProvider <= 0 {
+		perProvider = 30
+	}
+	if perProvider > 50 {
+		perProvider = 50
+	}
+	if limit <= 0 {
+		limit = 300
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	providerExpr := cpaProviderSQL()
+	query := `
+SELECT requested_at, provider_key, auth_index, source, model, alias, reasoning_effort, service_tier,
+latency_ms, ttft_ms, status_code, failed, total_tokens, input_tokens, output_tokens, reasoning_tokens,
+cached_tokens, cache_read_tokens, cache_creation_tokens
+FROM (
+  SELECT provider_events.*,
+  row_number() OVER (PARTITION BY provider_key ORDER BY requested_at DESC, id DESC) AS provider_rank
+  FROM (
+    SELECT id, requested_at, ` + providerExpr + ` AS provider_key, auth_index, source, model, alias, reasoning_effort, service_tier,
+    latency_ms, ttft_ms, status_code, failed, total_tokens, input_tokens, output_tokens, reasoning_tokens,
+    cached_tokens, cache_read_tokens, cache_creation_tokens
+    FROM usage_events
+    WHERE requested_at >= ? AND ` + usageScopeSQL("other") + `
+  ) provider_events
+)
+WHERE provider_rank <= ?
+ORDER BY requested_at DESC, id DESC
+LIMIT ?`
+	rows, err := db.QueryContext(ctx, query, since, perProvider, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanRecentRows(rows, prices)
+}
+
+func scanRecentRows(rows *sql.Rows, prices map[string]modelPrice) ([]recentRow, error) {
 	var out []recentRow
 	for rows.Next() {
 		var r recentRow
@@ -155,7 +199,7 @@ ORDER BY reset_at DESC`, now)
 
 func mergeEffectiveAutobans(bans []autobanRow, invalids []invalidAuthRow) []autobanRow {
 	if len(invalids) == 0 {
-		return bans
+		return dedupeAutobanRows(bans)
 	}
 	out := make([]autobanRow, 0, len(bans)+len(invalids))
 	out = append(out, bans...)
@@ -165,7 +209,7 @@ func mergeEffectiveAutobans(bans []autobanRow, invalids []invalidAuthRow) []auto
 		}
 		out = append(out, invalidAuthAsAutoban(invalid))
 	}
-	return out
+	return dedupeAutobanRows(out)
 }
 
 func invalidAuthAsAutoban(invalid invalidAuthRow) autobanRow {
@@ -185,6 +229,12 @@ func invalidAuthAsAutoban(invalid invalidAuthRow) autobanRow {
 		if reason == "" {
 			reason = "402 deactivated_workspace: team workspace is deactivated"
 		}
+	} else if status == http.StatusForbidden {
+		window = "403"
+		resetText = "删除或替换认证文件后解除"
+		if reason == "" {
+			reason = "403 forbidden: repeated failures for this credential/workspace"
+		}
 	}
 	return autobanRow{
 		AuthID:           invalid.AuthID,
@@ -201,6 +251,117 @@ func invalidAuthAsAutoban(invalid invalidAuthRow) autobanRow {
 		Active:           true,
 		LastStatusCode:   status,
 	}
+}
+
+func dedupeAutobanRows(rows []autobanRow) []autobanRow {
+	if len(rows) < 2 {
+		return rows
+	}
+	out := make([]autobanRow, 0, len(rows))
+	seen := make(map[string]int, len(rows))
+	for _, row := range rows {
+		key := autobanDedupeKey(row)
+		if key == "" {
+			out = append(out, row)
+			continue
+		}
+		if idx, ok := seen[key]; ok {
+			out[idx] = mergeDuplicateAutobanRow(out[idx], row)
+			continue
+		}
+		seen[key] = len(out)
+		out = append(out, row)
+	}
+	return out
+}
+
+func autobanDedupeKey(row autobanRow) string {
+	for _, value := range []string{row.AuthFile, row.AuthID, row.AuthIndex, row.Source} {
+		if file := fileNameIfJSON(value); file != "" {
+			return "file:" + normalizeAccountAlias(file)
+		}
+	}
+	aliases := authStateMatchAliases(row.AuthID, row.AuthIndex, row.Source, row.AuthFile)
+	if len(aliases) == 0 {
+		return ""
+	}
+	return "alias:" + aliases[0]
+}
+
+func mergeDuplicateAutobanRow(left, right autobanRow) autobanRow {
+	merged, other := left, right
+	if preferAutobanIdentity(right, left) {
+		merged, other = right, left
+	}
+	merged.Active = merged.Active || other.Active
+	merged.Provider = firstNonEmptyString(merged.Provider, other.Provider)
+	merged.Source = firstNonEmptyString(merged.Source, other.Source)
+	merged.AuthFile = firstNonEmptyString(merged.AuthFile, other.AuthFile)
+	if merged.LastStatusCode == 0 {
+		merged.LastStatusCode = other.LastStatusCode
+	}
+	if merged.BannedAt == 0 || (other.BannedAt > 0 && other.BannedAt < merged.BannedAt) {
+		merged.BannedAt = other.BannedAt
+		merged.BannedAtText = other.BannedAtText
+	}
+	if !autobanIsPermanentAuthState(merged) && other.ResetAt > merged.ResetAt {
+		merged.ResetAt = other.ResetAt
+		merged.ResetAtText = other.ResetAtText
+		merged.SecondsRemaining = other.SecondsRemaining
+		merged.Window = firstNonEmptyString(other.Window, merged.Window)
+		merged.Reason = firstNonEmptyString(other.Reason, merged.Reason)
+	}
+	if merged.PrimaryUsedPercent == nil {
+		merged.PrimaryUsedPercent = other.PrimaryUsedPercent
+	}
+	if merged.PrimaryResetAt == nil {
+		merged.PrimaryResetAt = other.PrimaryResetAt
+	}
+	if merged.SecondaryUsedPercent == nil {
+		merged.SecondaryUsedPercent = other.SecondaryUsedPercent
+	}
+	if merged.SecondaryResetAt == nil {
+		merged.SecondaryResetAt = other.SecondaryResetAt
+	}
+	return merged
+}
+
+func preferAutobanIdentity(candidate, current autobanRow) bool {
+	if cp, rp := autobanStatePriority(candidate), autobanStatePriority(current); cp != rp {
+		return cp > rp
+	}
+	if cs, rs := autobanIdentityScore(candidate), autobanIdentityScore(current); cs != rs {
+		return cs > rs
+	}
+	return candidate.ResetAt > current.ResetAt
+}
+
+func autobanStatePriority(row autobanRow) int {
+	if autobanIsPermanentAuthState(row) {
+		return 2
+	}
+	return 1
+}
+
+func autobanIdentityScore(row autobanRow) int {
+	if fileNameIfJSON(row.AuthFile) != "" || fileNameIfJSON(row.AuthID) != "" {
+		return 3
+	}
+	if fileNameIfJSON(row.AuthIndex) != "" || fileNameIfJSON(row.Source) != "" {
+		return 2
+	}
+	if strings.TrimSpace(row.AuthID) != "" || strings.TrimSpace(row.AuthIndex) != "" {
+		return 1
+	}
+	return 0
+}
+
+func autobanIsPermanentAuthState(row autobanRow) bool {
+	window := strings.ToLower(strings.TrimSpace(row.Window))
+	return window == "401" || window == "402" || window == "403" ||
+		row.LastStatusCode == http.StatusUnauthorized ||
+		row.LastStatusCode == http.StatusPaymentRequired ||
+		row.LastStatusCode == http.StatusForbidden
 }
 
 func headerFloat(headers map[string][]string, key string) *float64 {

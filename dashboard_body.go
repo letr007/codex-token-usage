@@ -11,8 +11,7 @@ const dashboardBody = `</style>
       <button id="batch-proxy-open" class="ghost" type="button">批量写入代理</button>
       <select id="language" data-no-i18n aria-label="语言"><option value="zh">中文</option><option value="en">English</option></select>
       <select id="window" aria-label="统计窗口"><option value="24h">最近 24 小时</option><option value="today">今天</option><option value="7d">最近 7 天</option><option value="30d">最近 30 天</option><option value="all">全部</option></select>
-      <button id="export-csv" class="ghost">导出账号 CSV</button>
-      <button id="export-json" class="ghost">导出账号 JSON</button>
+      <button id="export-logs" class="ghost">导出日志</button>
       <button id="refresh">刷新</button>
     </div>
   </div>
@@ -81,6 +80,7 @@ const dashboardBody = `</style>
       <section class="section"><h2><span>Provider / 接入点总览</span><span class="mini">按 Provider 名称聚合，不进入 Codex 账号池</span></h2><div class="scroll"><table><thead><tr><th>Provider</th><th>请求</th><th>成功率</th><th>性能</th><th>总 Token</th><th>费用</th><th>输入</th><th>输出</th><th>缓存</th><th>缓存率</th><th>账号数</th><th>模型数</th><th>429</th><th>最近</th></tr></thead><tbody id="providers"></tbody></table></div></section>
       <section class="section"><h2><span>用量趋势</span><span class="mini">其他 AI Provider</span></h2><div class="section-body"><svg id="provider-trend" class="chart" viewBox="0 0 900 270" preserveAspectRatio="none"></svg><div class="legend"><span><i class="dot" style="background:var(--blue)"></i>请求</span><span><i class="dot" style="background:var(--cyan)"></i>总 Token</span><span><i class="dot" style="background:var(--orange)"></i>输出 Token</span></div></div></section>
     </div>
+    <section class="section" style="margin-top:8px"><h2><span>CPA 多 Key 用量</span><span class="mini">按 CPA 对外 Key 聚合模型、协议和 Token 额度</span></h2><div class="scroll key-summary-table-wrap"><table><thead><tr><th>Key</th><th>协议</th><th>接入点</th><th>请求</th><th>成功率</th><th>Token / 费用</th><th>模型数</th><th>429</th><th>最近</th></tr></thead><tbody id="key-summaries"></tbody></table></div></section>
     <section class="section" style="margin-top:8px"><h2><span>模型排行</span><span class="mini">其他 AI Provider</span></h2><div class="scroll model-table-wrap"><table><thead><tr><th>模型</th><th>别名</th><th>Provider</th><th>请求</th><th>总 Token</th><th>费用</th><th>性能</th><th>输入</th><th>输出</th><th>缓存</th><th>缓存率</th></tr></thead><tbody id="provider-models"></tbody></table></div></section>
     <section class="section" style="margin-top:8px"><h2><span>最近请求</span><span class="mini">其他 AI Provider 最近 30 条</span></h2><div class="scroll recent-table-wrap"><table><thead><tr><th>模型</th><th>耗时</th><th>Tokens</th><th>费用</th><th>详情</th></tr></thead><tbody id="provider-recent"></tbody></table></div></section>
   </section>
@@ -131,6 +131,24 @@ const dashboardBody = `</style>
       <button id="workspace-deactivated-select-page" class="ghost" type="button">全选当前页</button>
       <button id="workspace-deactivated-delete-selected" class="ghost danger-ghost" type="button">删除选中</button>
       <button id="workspace-deactivated-close-bottom" class="ghost" type="button">关闭</button>
+    </div>
+  </div>
+</div>
+<div id="log-export-modal" class="modal-backdrop" hidden>
+  <div class="modal-panel log-export-panel" role="dialog" aria-modal="true" aria-labelledby="log-export-title">
+    <div class="modal-head"><h2 id="log-export-title">导出日志</h2><button id="log-export-close" class="icon-button ghost" type="button" aria-label="关闭导出日志">×</button></div>
+    <div class="modal-body log-export-grid">
+      <label class="form-row"><span>账号</span><select id="log-export-account"><option value="">全部账号</option></select></label>
+      <label class="form-row"><span>接入点</span><select id="log-export-provider"><option value="">全部接入点</option></select></label>
+      <label class="form-row"><span>日期</span><input id="log-export-date" type="date"></label>
+      <label class="form-row"><span>模型</span><select id="log-export-model"><option value="">全部模型</option></select></label>
+      <label class="form-row"><span>状态</span><select id="log-export-status"><option value="all">全部状态</option><option value="success">成功</option><option value="failed">失败</option><option value="401">401</option><option value="402">402</option><option value="403">403</option><option value="429">429</option><option value="5xx">5xx</option></select></label>
+      <label class="form-row"><span>格式</span><select id="log-export-format"><option value="csv">CSV</option><option value="json">JSON</option></select></label>
+      <div id="log-export-status-text" class="modal-status" role="status" aria-live="polite">按当前页面范围导出请求日志。</div>
+    </div>
+    <div class="modal-actions">
+      <button id="log-export-apply" type="button">导出日志</button>
+      <button id="log-export-close-bottom" class="ghost" type="button">关闭</button>
     </div>
   </div>
 </div>

@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -284,6 +285,9 @@ func (s *store) summary(ctx context.Context, window string, limit int) (map[stri
 	if err := backfillWorkspaceDeactivatedAuthsFromUsage(ctx, db); err != nil {
 		return nil, err
 	}
+	if err := backfillWorkspaceDeactivatedAuthsFromQuotaTriggerRuns(ctx, db); err != nil {
+		return nil, err
+	}
 	if err := expireAutobans(ctx, db, now); err != nil {
 		return nil, err
 	}
@@ -338,6 +342,13 @@ func (s *store) summary(ctx context.Context, window string, limit int) (map[stri
 		return nil, err
 	}
 	providers = mergeConfiguredProviders(providers, readConfiguredProviderNames())
+	keySummaries, err := queryKeySummaries(ctx, db, since, limit)
+	if err != nil {
+		return nil, err
+	}
+	if err := applyKeySummaryCosts(ctx, db, since, keySummaries, prices); err != nil {
+		return nil, err
+	}
 	models, err := queryModels(ctx, db, since, limit, "codex")
 	if err != nil {
 		return nil, err
@@ -364,7 +375,7 @@ func (s *store) summary(ctx context.Context, window string, limit int) (map[stri
 	if err != nil {
 		return nil, err
 	}
-	providerRecent, err := queryRecent(ctx, db, since, providerRecentLimit(limit), "other", prices)
+	providerRecent, err := queryProviderRecent(ctx, db, since, 30, providerRecentLimit(limit), prices)
 	if err != nil {
 		return nil, err
 	}
@@ -387,6 +398,7 @@ func (s *store) summary(ctx context.Context, window string, limit int) (map[stri
 		"provider_totals":             providerTotals,
 		"accounts":                    accounts,
 		"providers":                   providers,
+		"key_summaries":               keySummaries,
 		"models":                      models,
 		"provider_models":             providerModels,
 		"trend":                       trend,
@@ -411,8 +423,27 @@ func clearAndFilterMissingAutobanRows(ctx context.Context, db *sql.DB, rows []au
 		return rows
 	}
 	aliases := configuredAliasSet(configured)
+	strictAliases := configuredStrictAliasSet(configured)
 	out := rows[:0]
 	for _, row := range rows {
+		cleanupAliases := fileBackedCleanupAliases(row.AuthID, row.AuthIndex, row.Source, row.AuthFile)
+		if len(cleanupAliases) > 0 {
+			if aliasesContainAny(strictAliases, cleanupAliases...) {
+				out = append(out, row)
+			} else {
+				_, _ = db.ExecContext(ctx, `UPDATE autoban_bans SET active=0 WHERE active=1 AND auth_id=?`, row.AuthID)
+			}
+			continue
+		}
+		rowStrictAliases := strictAuthStateAliasesForValues(row.AuthID, row.AuthIndex, row.Source, row.AuthFile)
+		if len(rowStrictAliases) > 0 {
+			if aliasesContainAny(strictAliases, rowStrictAliases...) {
+				out = append(out, row)
+			} else {
+				_, _ = db.ExecContext(ctx, `UPDATE autoban_bans SET active=0 WHERE active=1 AND auth_id=?`, row.AuthID)
+			}
+			continue
+		}
 		if !fileBackedAuthState(row.AuthID, row.AuthIndex, row.Source, row.AuthFile) || aliasesContainAny(aliases, row.AuthID, row.AuthIndex, row.Source, row.AuthFile) {
 			out = append(out, row)
 			continue
@@ -628,6 +659,36 @@ type providerRow struct {
 	SlowRequests          int64   `json:"slow_requests"`
 	SlowTTFTRequests      int64   `json:"slow_ttft_requests"`
 	Accounts              int64   `json:"accounts"`
+	Models                int64   `json:"models"`
+	LastSeen              string  `json:"last_seen"`
+}
+
+type keySummaryRow struct {
+	KeyID                 string  `json:"key_id"`
+	RawKeyID              string  `json:"-"`
+	Protocol              string  `json:"protocol"`
+	Provider              string  `json:"provider,omitempty"`
+	Providers             int64   `json:"providers,omitempty"`
+	ProviderNames         string  `json:"provider_names,omitempty"`
+	Requests              int64   `json:"requests"`
+	Failed                int64   `json:"failed"`
+	RateLimited           int64   `json:"rate_limited"`
+	InputTokens           int64   `json:"input_tokens"`
+	OutputTokens          int64   `json:"output_tokens"`
+	ReasoningTokens       int64   `json:"reasoning_tokens"`
+	CachedTokens          int64   `json:"cached_tokens"`
+	CacheReadTokens       int64   `json:"cache_read_tokens"`
+	CacheCreationTokens   int64   `json:"cache_creation_tokens"`
+	TotalTokens           int64   `json:"total_tokens"`
+	QuotaUsedTokens       int64   `json:"quota_used_tokens"`
+	CostUSD               float64 `json:"cost_usd"`
+	CostAvailable         bool    `json:"cost_available"`
+	UnpricedTokens        int64   `json:"unpriced_tokens,omitempty"`
+	AverageLatencyMs      float64 `json:"avg_latency_ms"`
+	AverageTTFTMs         float64 `json:"avg_ttft_ms"`
+	OutputTokensPerSecond float64 `json:"output_tokens_per_second"`
+	SlowRequests          int64   `json:"slow_requests"`
+	SlowTTFTRequests      int64   `json:"slow_ttft_requests"`
 	Models                int64   `json:"models"`
 	LastSeen              string  `json:"last_seen"`
 }
@@ -1187,6 +1248,9 @@ func hostFromURL(value string) string {
 }
 
 func authFileStateForRecord(rec usageRecord) (string, int64) {
+	if authFile := fileNameIfJSON(rec.AuthFile); authFile != "" {
+		return authFileStateForName(authFile)
+	}
 	if authFile := firstNonEmptyString(fileNameIfJSON(rec.AuthIndex), fileNameIfJSON(rec.Source), fileNameIfJSON(rec.AuthID)); authFile != "" {
 		return authFileStateForName(authFile)
 	}
@@ -1272,7 +1336,7 @@ func mergeConfiguredAccounts(accounts []accountRow, configured []configuredAccou
 	merged := append([]accountRow(nil), accounts...)
 	index := make(map[string]int, len(merged)*4)
 	for i := range merged {
-		for _, alias := range accountAliases(merged[i]) {
+		for _, alias := range accountMergeAliases(merged[i]) {
 			if alias == "" {
 				continue
 			}
@@ -1300,7 +1364,7 @@ func mergeConfiguredAccounts(accounts []accountRow, configured []configuredAccou
 		}
 		if match >= 0 {
 			enrichConfiguredAccount(&merged[match], cfg)
-			for _, alias := range accountAliases(merged[match]) {
+			for _, alias := range accountMergeAliases(merged[match]) {
 				if alias != "" {
 					index[alias] = match
 				}
@@ -1323,7 +1387,7 @@ func mergeConfiguredAccounts(accounts []accountRow, configured []configuredAccou
 		}
 		merged = append(merged, row)
 		rowIndex := len(merged) - 1
-		for _, alias := range accountAliases(row) {
+		for _, alias := range accountMergeAliases(row) {
 			if alias != "" {
 				index[alias] = rowIndex
 			}
@@ -1347,8 +1411,16 @@ func filterCurrentConfiguredAccounts(accounts []accountRow, configured []configu
 	if len(aliases) == 0 {
 		return nil
 	}
+	strictAliases := configuredStrictAliasSet(configured)
 	out := accounts[:0]
 	for _, account := range accounts {
+		cleanupAliases := accountFileIdentityAliases(account)
+		if len(cleanupAliases) > 0 {
+			if aliasesAllContained(strictAliases, cleanupAliases...) {
+				out = append(out, account)
+			}
+			continue
+		}
 		keep := false
 		for _, alias := range accountAliases(account) {
 			if _, ok := aliases[alias]; ok {
@@ -1361,6 +1433,23 @@ func filterCurrentConfiguredAccounts(accounts []accountRow, configured []configu
 		}
 	}
 	return out
+}
+
+func accountMergeAliases(row accountRow) []string {
+	if aliases := accountFileIdentityAliases(row); len(aliases) > 0 {
+		return aliases
+	}
+	return accountAliases(row)
+}
+
+func accountFileIdentityAliases(row accountRow) []string {
+	var values []string
+	for _, value := range []string{row.AuthFile, row.AuthID, row.AuthIndex, row.Source} {
+		if file := fileNameIfJSON(value); file != "" {
+			values = append(values, file)
+		}
+	}
+	return normalizeAccountAliases(values...)
 }
 
 func enrichConfiguredAccount(row *accountRow, cfg configuredAccount) {
@@ -2015,7 +2104,8 @@ func applyInvalidAuths(accounts []accountRow, invalids []invalidAuthRow) {
 	}
 	for _, invalid := range invalids {
 		matched := false
-		for _, alias := range normalizeAccountAliases(invalid.AuthFile, invalid.AuthIndex) {
+		strictAliases := strictAuthStateAliasesForValues(invalid.AuthID, invalid.AuthIndex, invalid.Source, invalid.AuthFile)
+		for _, alias := range strictAliases {
 			i, ok := strictIndex[alias]
 			if !ok {
 				continue
@@ -2025,6 +2115,9 @@ func applyInvalidAuths(accounts []accountRow, invalids []invalidAuthRow) {
 			break
 		}
 		if matched {
+			continue
+		}
+		if len(strictAliases) > 0 {
 			continue
 		}
 		for _, alias := range normalizeAccountAliases(invalid.AuthID, invalid.AuthIndex, invalid.Source, invalid.AuthFile) {
@@ -2420,6 +2513,106 @@ LIMIT ?`
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+func queryKeySummaries(ctx context.Context, db *sql.DB, since int64, limit int) ([]keySummaryRow, error) {
+	query := `
+SELECT raw_key, protocol_key,
+COUNT(DISTINCT provider_key), GROUP_CONCAT(DISTINCT provider_key),
+COUNT(*), COALESCE(SUM(failed),0), COALESCE(SUM(CASE WHEN status_code=429 THEN 1 ELSE 0 END),0),
+COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(reasoning_tokens),0),
+COALESCE(SUM(cached_tokens),0), COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_creation_tokens),0),
+COALESCE(SUM(total_tokens),0),
+COALESCE(AVG(CASE WHEN latency_ms > 0 THEN latency_ms END),0),
+COALESCE(AVG(CASE WHEN ttft_ms > 0 THEN ttft_ms END),0),
+` + throughputSQL() + `,
+COALESCE(SUM(CASE WHEN latency_ms >= 12000 THEN 1 ELSE 0 END),0),
+COALESCE(SUM(CASE WHEN ttft_ms >= 3000 THEN 1 ELSE 0 END),0),
+COUNT(DISTINCT NULLIF(model,'')),
+MAX(requested_at)
+FROM (
+  SELECT api_key AS raw_key, ` + keyProtocolSQL() + ` AS protocol_key, ` + cpaProviderSQL() + ` AS provider_key,
+    requested_at, failed, status_code, input_tokens, output_tokens, reasoning_tokens,
+    cached_tokens, cache_read_tokens, cache_creation_tokens, total_tokens,
+    latency_ms, ttft_ms, output_tokens, model
+  FROM usage_events
+  WHERE requested_at >= ? AND api_key <> ''
+) keyed
+GROUP BY raw_key, protocol_key
+ORDER BY SUM(total_tokens) DESC, COUNT(*) DESC
+LIMIT ?`
+	rows, err := db.QueryContext(ctx, query, since, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []keySummaryRow
+	for rows.Next() {
+		var r keySummaryRow
+		var providers string
+		var last int64
+		if err := rows.Scan(
+			&r.RawKeyID, &r.Protocol, &r.Providers, &providers, &r.Requests, &r.Failed, &r.RateLimited,
+			&r.InputTokens, &r.OutputTokens, &r.ReasoningTokens, &r.CachedTokens, &r.CacheReadTokens, &r.CacheCreationTokens,
+			&r.TotalTokens, &r.AverageLatencyMs, &r.AverageTTFTMs, &r.OutputTokensPerSecond, &r.SlowRequests,
+			&r.SlowTTFTRequests, &r.Models, &last,
+		); err != nil {
+			return nil, err
+		}
+		r.KeyID = safeExportLabel(r.RawKeyID)
+		r.ProviderNames = normalizeKeyProviderNames(providers)
+		r.Provider = firstKeyProviderName(r.ProviderNames)
+		r.QuotaUsedTokens = r.TotalTokens
+		r.LastSeen = unixTime(last)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+func keyProtocolSQL() string {
+	return `CASE
+WHEN lower(auth_type) IN ('apikey', 'api_key', 'key', 'api-key') THEN 'apikey'
+WHEN lower(auth_type) IN ('oauth', 'codex') THEN lower(auth_type)
+WHEN lower(executor_type) LIKE '%codex%' THEN 'codex'
+WHEN lower(executor_type) LIKE '%claude%' OR lower(provider) IN ('anthropic','claude') THEN 'claude'
+WHEN lower(executor_type) LIKE '%gemini%' OR lower(provider) LIKE 'gemini%' THEN 'gemini'
+WHEN lower(provider) LIKE 'openai%' THEN 'openai-compatible'
+ELSE COALESCE(NULLIF(lower(auth_type),''), NULLIF(lower(provider),''), 'unknown')
+END`
+}
+
+func keySummaryGroupKey(rawKey, protocol string) string {
+	return normalizeAccountAlias(rawKey) + "\x00" + strings.ToLower(strings.TrimSpace(protocol))
+}
+
+func normalizeKeyProviderNames(value string) string {
+	parts := strings.Split(value, ",")
+	seen := map[string]bool{}
+	var out []string
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		key := normalizeAccountAlias(part)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, part)
+	}
+	sort.Strings(out)
+	return strings.Join(out, " / ")
+}
+
+func firstKeyProviderName(value string) string {
+	parts := strings.Split(value, " / ")
+	for _, part := range parts {
+		if strings.TrimSpace(part) != "" {
+			return strings.TrimSpace(part)
+		}
+	}
+	return ""
 }
 
 func cpaProviderSQL() string {

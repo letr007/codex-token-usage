@@ -47,6 +47,9 @@ CREATE INDEX IF NOT EXISTS idx_usage_events_model ON usage_events(model, alias, 
 CREATE INDEX IF NOT EXISTS idx_usage_events_requested_auth_id ON usage_events(requested_at, auth_id);
 CREATE INDEX IF NOT EXISTS idx_usage_events_requested_source ON usage_events(requested_at, source);
 CREATE INDEX IF NOT EXISTS idx_usage_events_quota_scan ON usage_events(requested_at, failed, status_code);
+CREATE INDEX IF NOT EXISTS idx_usage_events_api_key_requested ON usage_events(api_key, requested_at);
+CREATE INDEX IF NOT EXISTS idx_usage_events_provider_requested ON usage_events(provider, requested_at);
+CREATE INDEX IF NOT EXISTS idx_usage_events_status_requested ON usage_events(status_code, requested_at);
 CREATE TABLE IF NOT EXISTS autoban_bans (
   auth_id TEXT PRIMARY KEY,
   auth_index TEXT NOT NULL DEFAULT '',

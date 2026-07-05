@@ -66,7 +66,7 @@ const (
 )
 
 var (
-	pluginVersion    = "0.1.15"
+	pluginVersion    = "0.1.16"
 	pluginAuthor     = "Codex Token Usage Contributors"
 	pluginRepository = "https://github.com/zhumengling/codex-token-usage"
 )
@@ -243,6 +243,7 @@ type usageRecord struct {
 	AuthID          string              `json:"AuthID"`
 	AuthIndex       string              `json:"AuthIndex"`
 	AuthType        string              `json:"AuthType"`
+	AuthFile        string              `json:"AuthFile"`
 	Source          string              `json:"Source"`
 	ReasoningEffort string              `json:"ReasoningEffort"`
 	ServiceTier     string              `json:"ServiceTier"`
@@ -269,6 +270,8 @@ type usageDetail struct {
 	CacheCreationTokens int64 `json:"CacheCreationTokens"`
 	TotalTokens         int64 `json:"TotalTokens"`
 }
+
+const forbiddenInvalidAuthThreshold = 3
 
 func main() {}
 
@@ -436,7 +439,7 @@ func handleManagement(req managementRequest) managementResponse {
 		limit := parseInt(firstQuery(req.Query, "limit", "5000"), 5000, 1, 20000)
 		kind := firstQuery(req.Query, "type", "accounts")
 		format := firstQuery(req.Query, "format", "csv")
-		return handleExport(context.Background(), window, kind, format, limit)
+		return handleExportWithFilters(context.Background(), window, kind, format, limit, req.Query)
 	}
 	return jsonResponse(http.StatusNotFound, map[string]any{"error": "not_found"})
 }
@@ -996,6 +999,9 @@ func (s *store) recordUsage(ctx context.Context, rec usageRecord) error {
 	if err := recordInvalidAuthIfNeeded(ctx, db, rec, status); err != nil {
 		return err
 	}
+	if err := recordRepeatedForbiddenIfNeeded(ctx, db, rec, status); err != nil {
+		return err
+	}
 	if err := clearRecoveredAuthStateIfNeeded(ctx, db, rec, status); err != nil {
 		return err
 	}
@@ -1010,12 +1016,15 @@ func recordInvalidAuthIfNeeded(ctx context.Context, db *sql.DB, rec usageRecord,
 	if reason == "" {
 		return nil
 	}
-	authID := firstNonEmptyString(rec.AuthID, rec.AuthIndex, rec.Source)
+	authFile, authFileMTime := authFileStateForRecord(rec)
+	authID := invalidAuthIDForRecord(rec, authFile)
 	if authID == "" {
 		return nil
 	}
-	now := time.Now().Unix()
-	authFile, authFileMTime := authFileStateForRecord(rec)
+	return upsertInvalidAuth(ctx, db, rec, status, reason, authID, authFile, authFileMTime, time.Now().Unix())
+}
+
+func upsertInvalidAuth(ctx context.Context, db *sql.DB, rec usageRecord, status int, reason, authID, authFile string, authFileMTime int64, invalidatedAt int64) error {
 	_, err := db.ExecContext(ctx, `
 INSERT INTO invalid_auths (
   auth_id, auth_index, source, provider, reason, invalidated_at, active,
@@ -1032,9 +1041,50 @@ ON CONFLICT(auth_id) DO UPDATE SET
   auth_file=excluded.auth_file,
   auth_file_mtime=excluded.auth_file_mtime`,
 		trim(authID), trim(rec.AuthIndex), trim(rec.Source), trim(rec.Provider),
-		reason, now, status, authFile, authFileMTime,
+		reason, invalidatedAt, status, authFile, authFileMTime,
 	)
 	return err
+}
+
+func invalidAuthIDForRecord(rec usageRecord, authFile string) string {
+	if authFile != "" && shouldUseStrictAuthFileIdentity(rec, authFile) {
+		return authFile
+	}
+	return firstNonEmptyString(rec.AuthID, rec.AuthIndex, rec.Source)
+}
+
+func shouldUseStrictAuthFileIdentity(rec usageRecord, authFile string) bool {
+	if authFile == "" {
+		return false
+	}
+	if fileNameIfJSON(rec.AuthID) != "" || fileNameIfJSON(rec.Source) != "" {
+		return true
+	}
+	email := normalizeAccountAlias(firstNonEmptyString(rec.Source, rec.AuthID))
+	if email == "" {
+		return false
+	}
+	return configuredEmailCounts(readConfiguredAuthAccounts())[email] > 1
+}
+
+func recordRepeatedForbiddenIfNeeded(ctx context.Context, db *sql.DB, rec usageRecord, status int) error {
+	if !strings.EqualFold(trim(rec.Provider), "codex") {
+		return nil
+	}
+	if !rec.Failed || status != http.StatusForbidden {
+		return nil
+	}
+	authFile, authFileMTime := authFileStateForRecord(rec)
+	aliases := normalizeAccountAliases(authFile, fileNameIfJSON(rec.AuthID), fileNameIfJSON(rec.AuthIndex), rec.AuthIndex)
+	if len(aliases) == 0 || !recentForbiddenThresholdReached(ctx, db, aliases, forbiddenInvalidAuthThreshold) {
+		return nil
+	}
+	authID := firstNonEmptyString(authFile, fileNameIfJSON(rec.AuthID), rec.AuthIndex)
+	if authID == "" {
+		return nil
+	}
+	reason := "403 forbidden: repeated failures for this credential/workspace"
+	return upsertInvalidAuth(ctx, db, rec, status, reason, authID, authFile, authFileMTime, time.Now().Unix())
 }
 
 func invalidAuthReasonForRecord(rec usageRecord, status int) string {
@@ -1060,8 +1110,30 @@ func clearRecoveredAuthStateIfNeeded(ctx context.Context, db *sql.DB, rec usageR
 	if rec.Failed || !successfulStatusCode(status) {
 		return nil
 	}
-	for _, alias := range normalizeAccountAliases(rec.AuthID, rec.AuthIndex, rec.Source) {
-		if alias == "" {
+	aliases, strict := recoveryMatchAliasesForRecord(rec)
+	for _, alias := range aliases {
+		if strict {
+			if _, err := db.ExecContext(ctx, `
+UPDATE invalid_auths
+SET active=0
+WHERE active=1
+AND (
+  lower(auth_file)=?
+  OR lower(auth_id)=?
+  OR lower(auth_index)=?
+)`, alias, alias, alias); err != nil {
+				return err
+			}
+			if _, err := db.ExecContext(ctx, `
+UPDATE autoban_bans
+SET active=0
+WHERE active=1
+AND (
+  lower(auth_id)=?
+  OR lower(auth_index)=?
+)`, alias, alias); err != nil {
+				return err
+			}
 			continue
 		}
 		if _, err := db.ExecContext(ctx, `
@@ -1089,6 +1161,17 @@ AND (
 		}
 	}
 	return nil
+}
+
+func recoveryMatchAliasesForRecord(rec usageRecord) ([]string, bool) {
+	authFile, _ := authFileStateForRecord(rec)
+	email := normalizeAccountAlias(firstNonEmptyString(rec.Source, rec.AuthID))
+	strict := rec.AuthFile != "" || (authFile != "" && email != "" && configuredEmailCounts(readConfiguredAuthAccounts())[email] > 1)
+	if strict {
+		aliases := strictAuthStateAliasesForValues(rec.AuthID, rec.AuthIndex, rec.Source, authFile)
+		return aliases, len(aliases) > 0
+	}
+	return normalizeAccountAliases(rec.AuthID, rec.AuthIndex, rec.Source), false
 }
 
 func successfulStatusCode(status int) bool {
@@ -1192,6 +1275,19 @@ func (s *store) runQuotaTriggerRound(ctx context.Context, cfg pluginConfig) (int
 		if err := recordQuotaTriggerRun(ctx, db, run); err != nil {
 			failed++
 			continue
+		}
+		if run.HTTPStatus == http.StatusForbidden {
+			rec := usageRecord{
+				Provider:  firstNonEmptyString(run.Provider, "codex"),
+				AuthID:    run.AuthID,
+				AuthIndex: run.AuthIndex,
+				AuthType:  "codex",
+				AuthFile:  run.AuthFile,
+				Source:    run.Source,
+				Failed:    true,
+				Failure:   usageFailure{StatusCode: run.HTTPStatus},
+			}
+			_ = recordRepeatedForbiddenIfNeeded(ctx, db, rec, run.HTTPStatus)
 		}
 		if run.Status == "success" {
 			success++
@@ -1334,6 +1430,7 @@ func executeQuotaProbeRequest(ctx context.Context, db *sql.DB, account triggerAu
 		AuthID:          account.AuthID,
 		AuthIndex:       account.AuthIndex,
 		AuthType:        "codex",
+		AuthFile:        account.AuthFile,
 		Source:          account.Source,
 		RequestedAt:     time.Unix(run.StartedAt, 0),
 		ResponseHeaders: responseHeaders,
@@ -1497,6 +1594,7 @@ func executeQuotaUsageRequest(ctx context.Context, db *sql.DB, account triggerAu
 		AuthID:          account.AuthID,
 		AuthIndex:       account.AuthIndex,
 		AuthType:        "codex",
+		AuthFile:        account.AuthFile,
 		Source:          account.Source,
 		RequestedAt:     time.Unix(run.StartedAt, 0),
 		ResponseHeaders: headers,
@@ -1571,8 +1669,14 @@ func quotaTriggerRunFromAccount(account triggerAuthAccount, mode, status string,
 
 func configuredMatchesInvalidAuth(cfg configuredAccount, invalids []invalidAuthRow) bool {
 	for _, invalid := range invalids {
-		for _, left := range configuredAliases(cfg) {
-			for _, right := range normalizeAccountAliases(invalid.AuthID, invalid.AuthIndex, invalid.Source, invalid.AuthFile) {
+		leftAliases := configuredAliases(cfg)
+		rightAliases := normalizeAccountAliases(invalid.AuthID, invalid.AuthIndex, invalid.Source, invalid.AuthFile)
+		if strict := strictAuthStateAliasesForValues(invalid.AuthID, invalid.AuthIndex, invalid.Source, invalid.AuthFile); len(strict) > 0 {
+			leftAliases = normalizeAccountAliases(cfg.AuthFile, cfg.AuthIndex, cfg.ChatGPTAccountID)
+			rightAliases = strict
+		}
+		for _, left := range leftAliases {
+			for _, right := range rightAliases {
 				if left != "" && left == right {
 					return true
 				}
@@ -1584,8 +1688,14 @@ func configuredMatchesInvalidAuth(cfg configuredAccount, invalids []invalidAuthR
 
 func configuredMatchesAutoban(cfg configuredAccount, bans []autobanRow) bool {
 	for _, ban := range bans {
-		for _, left := range configuredAliases(cfg) {
-			for _, right := range normalizeAccountAliases(ban.AuthID, ban.AuthIndex, ban.Source, ban.AuthFile) {
+		leftAliases := configuredAliases(cfg)
+		rightAliases := normalizeAccountAliases(ban.AuthID, ban.AuthIndex, ban.Source, ban.AuthFile)
+		if strict := strictAuthStateAliasesForValues(ban.AuthID, ban.AuthIndex, ban.Source, ban.AuthFile); len(strict) > 0 {
+			leftAliases = normalizeAccountAliases(cfg.AuthFile, cfg.AuthIndex, cfg.ChatGPTAccountID)
+			rightAliases = strict
+		}
+		for _, left := range leftAliases {
+			for _, right := range rightAliases {
 				if left != "" && left == right {
 					return true
 				}
@@ -1938,7 +2048,7 @@ func (s *store) pickAuth(ctx context.Context, req schedulerPickRequest) (schedul
 }
 
 func newNoAvailableCodexAuthError(bans []autobanRow, now int64) error {
-	message := "no available Codex auth candidates: all candidates are auto-banned by 429/401/402"
+	message := "no available Codex auth candidates: all candidates are auto-banned by 429/401/402/403"
 	if resetAt := earliestActiveBanReset(bans, now); resetAt > 0 {
 		message += "; earliest autoban reset at " + unixTime(resetAt)
 	}
@@ -2115,6 +2225,8 @@ WHERE autoban_bans.active=0 OR excluded.reset_at >= autoban_bans.reset_at`,
 }
 
 func backfillWorkspaceDeactivatedAuthsFromUsage(ctx context.Context, db *sql.DB) error {
+	configured := readConfiguredAuthAccounts()
+	authDirReadable := configuredAuthDirectoryReadable()
 	rows, err := db.QueryContext(ctx, `
 WITH latest AS (
   SELECT
@@ -2146,6 +2258,9 @@ LIMIT 1000`)
 		rec.RequestedAt = time.Unix(requestedAt, 0)
 		rec.Failed = true
 		rec.Failure = usageFailure{StatusCode: status}
+		if recordReferencesMissingCurrentAuthFile(rec, configured, authDirReadable) {
+			continue
+		}
 		if !codexAuthRecordLooksFileBacked(rec) {
 			continue
 		}
@@ -2162,7 +2277,128 @@ LIMIT 1000`)
 	return rows.Err()
 }
 
+func backfillWorkspaceDeactivatedAuthsFromQuotaTriggerRuns(ctx context.Context, db *sql.DB) error {
+	configured := readConfiguredAuthAccounts()
+	authDirReadable := configuredAuthDirectoryReadable()
+	rows, err := db.QueryContext(ctx, `
+WITH latest AS (
+  SELECT
+    auth_id, auth_index, source, provider, auth_file, finished_at, http_status, error,
+    ROW_NUMBER() OVER (
+      PARTITION BY lower(COALESCE(NULLIF(auth_file,''), NULLIF(auth_id,''), NULLIF(auth_index,''), NULLIF(source,'')))
+      ORDER BY finished_at DESC, id DESC
+    ) AS rn
+  FROM quota_trigger_runs
+  WHERE provider='codex'
+    AND COALESCE(NULLIF(auth_file,''), NULLIF(auth_id,''), NULLIF(auth_index,''), NULLIF(source,'')) <> ''
+)
+SELECT auth_id, auth_index, source, provider, auth_file, finished_at, http_status, error
+FROM latest
+WHERE rn=1 AND http_status=402
+ORDER BY finished_at DESC
+LIMIT 1000`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var authID, authIndex, source, provider, authFile, message string
+		var finishedAt int64
+		var status int
+		if err := rows.Scan(&authID, &authIndex, &source, &provider, &authFile, &finishedAt, &status, &message); err != nil {
+			return err
+		}
+		rec := usageRecord{
+			Provider:    firstNonEmptyString(provider, "codex"),
+			AuthID:      authID,
+			AuthIndex:   authIndex,
+			AuthFile:    authFile,
+			Source:      source,
+			RequestedAt: time.Unix(finishedAt, 0),
+			Failed:      true,
+			Failure:     usageFailure{StatusCode: status, Body: message},
+		}
+		if recordReferencesMissingCurrentAuthFile(rec, configured, authDirReadable) {
+			continue
+		}
+		if !codexAuthRecordLooksFileBacked(rec) {
+			continue
+		}
+		if hasLaterSuccessfulUsage(ctx, db, rec, finishedAt) {
+			continue
+		}
+		if err := recordInvalidAuthIfNeeded(ctx, db, rec, status); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
+func recordReferencesMissingCurrentAuthFile(rec usageRecord, configured []configuredAccount, authDirReadable bool) bool {
+	if !authDirReadable {
+		return false
+	}
+	var explicit []string
+	for _, value := range []string{rec.AuthFile, rec.AuthID, rec.AuthIndex, rec.Source} {
+		if file := fileNameIfJSON(value); file != "" {
+			explicit = append(explicit, file)
+		}
+	}
+	if len(explicit) == 0 {
+		return false
+	}
+	strictAliases := configuredStrictAliasSet(configured)
+	for _, file := range explicit {
+		if !aliasesContainAny(strictAliases, file) {
+			return true
+		}
+	}
+	return false
+}
+
 func hasLaterSuccessfulUsage(ctx context.Context, db *sql.DB, rec usageRecord, after int64) bool {
+	aliases, strict := recoveryMatchAliasesForRecord(rec)
+	if len(aliases) == 0 {
+		return false
+	}
+	usageColumns := []string{"auth_id", "auth_index", "source"}
+	triggerColumns := []string{"auth_id", "auth_index", "source", "auth_file"}
+	if strict {
+		usageColumns = []string{"auth_id", "auth_index"}
+		triggerColumns = []string{"auth_id", "auth_index", "auth_file"}
+	}
+	usageCond, usageArgs := sqlLowerInCondition(usageColumns, aliases)
+	triggerCond, triggerArgs := sqlLowerInCondition(triggerColumns, aliases)
+	if usageCond == "" || triggerCond == "" {
+		return false
+	}
+	args := []any{after}
+	args = append(args, usageArgs...)
+	args = append(args, after)
+	args = append(args, triggerArgs...)
+	var count int
+	err := db.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM (
+  SELECT requested_at AS ts
+  FROM usage_events
+  WHERE provider='codex'
+    AND requested_at > ?
+    AND failed=0
+    AND (status_code=0 OR (status_code >= 200 AND status_code < 300))
+    AND `+usageCond+`
+  UNION ALL
+  SELECT finished_at AS ts
+  FROM quota_trigger_runs
+  WHERE provider='codex'
+    AND finished_at > ?
+    AND status='success'
+    AND `+triggerCond+`
+)`, args...).Scan(&count)
+	return err == nil && count > 0
+}
+
+func legacyHasLaterSuccessfulUsage(ctx context.Context, db *sql.DB, rec usageRecord, after int64) bool {
 	for _, alias := range normalizeAccountAliases(rec.AuthID, rec.AuthIndex, rec.Source) {
 		if alias == "" {
 			continue
@@ -2197,6 +2433,7 @@ func clearRecoveredAuthStatesFromUsage(ctx context.Context, db *sql.DB) error {
 			Provider:  firstNonEmptyString(invalid.Provider, "codex"),
 			AuthID:    invalid.AuthID,
 			AuthIndex: invalid.AuthIndex,
+			AuthFile:  invalid.AuthFile,
 			Source:    invalid.Source,
 		}
 		if !hasLaterSuccessfulUsage(ctx, db, rec, invalid.InvalidatedAt) {
@@ -2215,6 +2452,7 @@ func clearRecoveredAuthStatesFromUsage(ctx context.Context, db *sql.DB) error {
 			Provider:  firstNonEmptyString(ban.Provider, "codex"),
 			AuthID:    ban.AuthID,
 			AuthIndex: ban.AuthIndex,
+			AuthFile:  ban.AuthFile,
 			Source:    ban.Source,
 		}
 		if !hasLaterSuccessfulUsage(ctx, db, rec, ban.BannedAt) {
@@ -2256,6 +2494,7 @@ func clearReplacedInvalidAuths(ctx context.Context, db *sql.DB) error {
 	if len(configured) == 0 {
 		return nil
 	}
+	emailCounts := configuredEmailCounts(configured)
 	for _, cfg := range configured {
 		if cfg.AuthFileMTime <= 0 {
 			continue
@@ -2270,7 +2509,7 @@ AND ? > invalidated_at`, cfg.AuthFile, cfg.AuthFileMTime)
 		if err != nil {
 			return err
 		}
-		for _, alias := range configuredAliases(cfg) {
+		for _, alias := range configuredAccountMatchAliases(cfg, emailCounts) {
 			if alias == "" {
 				continue
 			}
@@ -2297,16 +2536,29 @@ func clearMissingConfiguredAuthState(ctx context.Context, db *sql.DB, configured
 		return nil
 	}
 	aliases := configuredAliasSet(configured)
-	if err := clearMissingInvalidAuths(ctx, db, aliases); err != nil {
+	strictAliases := configuredStrictAliasSet(configured)
+	if err := clearMissingInvalidAuths(ctx, db, aliases, strictAliases); err != nil {
 		return err
 	}
-	return clearMissingAutobans(ctx, db, aliases)
+	return clearMissingAutobans(ctx, db, aliases, strictAliases)
 }
 
 func configuredAliasSet(configured []configuredAccount) map[string]struct{} {
 	aliases := make(map[string]struct{}, len(configured)*6)
 	for _, cfg := range configured {
 		for _, alias := range configuredAliases(cfg) {
+			if alias != "" {
+				aliases[alias] = struct{}{}
+			}
+		}
+	}
+	return aliases
+}
+
+func configuredStrictAliasSet(configured []configuredAccount) map[string]struct{} {
+	aliases := make(map[string]struct{}, len(configured)*4)
+	for _, cfg := range configured {
+		for _, alias := range normalizeAccountAliases(cfg.AuthFile, cfg.AuthIndex, cfg.ChatGPTAccountID) {
 			if alias != "" {
 				aliases[alias] = struct{}{}
 			}
@@ -2324,16 +2576,44 @@ func aliasesContainAny(aliases map[string]struct{}, values ...string) bool {
 	return false
 }
 
-func clearMissingInvalidAuths(ctx context.Context, db *sql.DB, configuredAliases map[string]struct{}) error {
+func aliasesAllContained(aliases map[string]struct{}, values ...string) bool {
+	normalized := normalizeAccountAliases(values...)
+	if len(normalized) == 0 {
+		return false
+	}
+	for _, alias := range normalized {
+		if _, ok := aliases[alias]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func clearMissingInvalidAuths(ctx context.Context, db *sql.DB, configuredAliases map[string]struct{}, configuredStrictAliases map[string]struct{}) error {
 	invalids, err := queryActiveInvalidAuths(ctx, db)
 	if err != nil {
 		return err
 	}
 	for _, invalid := range invalids {
-		if !fileBackedAuthState(invalid.AuthID, invalid.AuthIndex, invalid.Source, invalid.AuthFile) {
+		cleanupAliases := fileBackedCleanupAliases(invalid.AuthID, invalid.AuthIndex, invalid.Source, invalid.AuthFile)
+		if len(cleanupAliases) > 0 {
+			if aliasesContainAny(configuredStrictAliases, cleanupAliases...) {
+				continue
+			}
+			if _, err := db.ExecContext(ctx, `UPDATE invalid_auths SET active=0 WHERE active=1 AND auth_id=?`, invalid.AuthID); err != nil {
+				return err
+			}
 			continue
 		}
-		if aliasesContainAny(configuredAliases, invalid.AuthID, invalid.AuthIndex, invalid.Source, invalid.AuthFile) {
+		strictAliases := strictAuthStateAliasesForValues(invalid.AuthID, invalid.AuthIndex, invalid.Source, invalid.AuthFile)
+		if len(strictAliases) == 0 && !fileBackedAuthState(invalid.AuthID, invalid.AuthIndex, invalid.Source, invalid.AuthFile) {
+			continue
+		}
+		if len(strictAliases) > 0 {
+			if aliasesContainAny(configuredStrictAliases, strictAliases...) {
+				continue
+			}
+		} else if aliasesContainAny(configuredAliases, invalid.AuthID, invalid.AuthIndex, invalid.Source, invalid.AuthFile) {
 			continue
 		}
 		if _, err := db.ExecContext(ctx, `UPDATE invalid_auths SET active=0 WHERE active=1 AND auth_id=?`, invalid.AuthID); err != nil {
@@ -2343,16 +2623,31 @@ func clearMissingInvalidAuths(ctx context.Context, db *sql.DB, configuredAliases
 	return nil
 }
 
-func clearMissingAutobans(ctx context.Context, db *sql.DB, configuredAliases map[string]struct{}) error {
+func clearMissingAutobans(ctx context.Context, db *sql.DB, configuredAliases map[string]struct{}, configuredStrictAliases map[string]struct{}) error {
 	bans, err := queryActiveAutobans(ctx, db, time.Now().Unix())
 	if err != nil {
 		return err
 	}
 	for _, ban := range bans {
-		if !fileBackedAuthState(ban.AuthID, ban.AuthIndex, ban.Source, ban.AuthFile) {
+		cleanupAliases := fileBackedCleanupAliases(ban.AuthID, ban.AuthIndex, ban.Source, ban.AuthFile)
+		if len(cleanupAliases) > 0 {
+			if aliasesContainAny(configuredStrictAliases, cleanupAliases...) {
+				continue
+			}
+			if _, err := db.ExecContext(ctx, `UPDATE autoban_bans SET active=0 WHERE active=1 AND auth_id=?`, ban.AuthID); err != nil {
+				return err
+			}
 			continue
 		}
-		if aliasesContainAny(configuredAliases, ban.AuthID, ban.AuthIndex, ban.Source, ban.AuthFile) {
+		strictAliases := strictAuthStateAliasesForValues(ban.AuthID, ban.AuthIndex, ban.Source, ban.AuthFile)
+		if len(strictAliases) == 0 && !fileBackedAuthState(ban.AuthID, ban.AuthIndex, ban.Source, ban.AuthFile) {
+			continue
+		}
+		if len(strictAliases) > 0 {
+			if aliasesContainAny(configuredStrictAliases, strictAliases...) {
+				continue
+			}
+		} else if aliasesContainAny(configuredAliases, ban.AuthID, ban.AuthIndex, ban.Source, ban.AuthFile) {
 			continue
 		}
 		if _, err := db.ExecContext(ctx, `UPDATE autoban_bans SET active=0 WHERE active=1 AND auth_id=?`, ban.AuthID); err != nil {
@@ -2369,6 +2664,120 @@ func fileBackedAuthState(values ...string) bool {
 		}
 	}
 	return false
+}
+
+func fileBackedCleanupAliases(authID, authIndex, source, authFile string) []string {
+	var values []string
+	for _, value := range []string{authFile, authID, authIndex, source} {
+		if file := fileNameIfJSON(value); file != "" {
+			values = append(values, file)
+		}
+	}
+	if fileNameIfJSON(authFile) != "" && strings.TrimSpace(authIndex) != "" {
+		values = append(values, authIndex)
+	}
+	return normalizeAccountAliases(values...)
+}
+
+func strictAuthStateAliasesForValues(authID, authIndex, source, authFile string) []string {
+	authFile = fileNameIfJSON(authFile)
+	authIDFile := fileNameIfJSON(authID)
+	sourceFile := fileNameIfJSON(source)
+	if authIDFile == "" && sourceFile == "" && (authFile == "" || normalizeAccountAlias(authID) != normalizeAccountAlias(authFile)) {
+		return nil
+	}
+	var values []string
+	if authFile != "" {
+		values = append(values, authFile)
+	}
+	for _, file := range []string{authIDFile, sourceFile} {
+		if file != "" {
+			values = append(values, file)
+		}
+	}
+	if authFile != "" && strings.TrimSpace(authIndex) != "" {
+		values = append(values, authIndex)
+	}
+	return normalizeAccountAliases(values...)
+}
+
+func authStateMatchAliases(authID, authIndex, source, authFile string) []string {
+	if aliases := strictAuthStateAliasesForValues(authID, authIndex, source, authFile); len(aliases) > 0 {
+		return aliases
+	}
+	return normalizeAccountAliases(authID, authIndex, source, authFile)
+}
+
+func recentForbiddenThresholdReached(ctx context.Context, db *sql.DB, aliases []string, threshold int) bool {
+	if threshold <= 0 || len(aliases) == 0 {
+		return false
+	}
+	usageCond, usageArgs := sqlLowerInCondition([]string{"auth_id", "auth_index"}, aliases)
+	triggerCond, triggerArgs := sqlLowerInCondition([]string{"auth_id", "auth_index", "auth_file"}, aliases)
+	if usageCond == "" && triggerCond == "" {
+		return false
+	}
+	query := `
+SELECT status_code, failed
+FROM (
+  SELECT requested_at AS ts, id AS seq, status_code, failed
+  FROM usage_events
+  WHERE provider='codex' AND ` + usageCond + `
+  UNION ALL
+  SELECT finished_at AS ts, id + 1000000000 AS seq, http_status AS status_code,
+    CASE WHEN status='success' THEN 0 ELSE 1 END AS failed
+  FROM quota_trigger_runs
+  WHERE provider='codex' AND ` + triggerCond + `
+)
+ORDER BY ts DESC, seq DESC
+LIMIT ?`
+	args := append([]any{}, usageArgs...)
+	args = append(args, triggerArgs...)
+	args = append(args, threshold)
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	count := 0
+	for rows.Next() {
+		var status int
+		var failed int
+		if err := rows.Scan(&status, &failed); err != nil {
+			return false
+		}
+		if failed == 0 || status != http.StatusForbidden {
+			return false
+		}
+		count++
+	}
+	return count >= threshold
+}
+
+func sqlLowerInCondition(columns []string, aliases []string) (string, []any) {
+	seen := map[string]bool{}
+	var values []string
+	for _, alias := range aliases {
+		alias = normalizeAccountAlias(alias)
+		if alias == "" || seen[alias] {
+			continue
+		}
+		seen[alias] = true
+		values = append(values, alias)
+	}
+	if len(values) == 0 || len(columns) == 0 {
+		return "", nil
+	}
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(values)), ",")
+	parts := make([]string, 0, len(columns))
+	args := make([]any, 0, len(columns)*len(values))
+	for _, column := range columns {
+		parts = append(parts, "lower("+column+") IN ("+placeholders+")")
+		for _, value := range values {
+			args = append(args, value)
+		}
+	}
+	return "(" + strings.Join(parts, " OR ") + ")", args
 }
 
 func queryActiveInvalidAuths(ctx context.Context, db *sql.DB) ([]invalidAuthRow, error) {
@@ -2403,13 +2812,20 @@ func candidateMatchesActiveBan(candidate schedulerAuthCandidate, bans []autobanR
 
 func candidateMatchesActiveBanIndexes(candidate schedulerAuthCandidate, bans []autobanRow) (bool, []int) {
 	aliases := schedulerCandidateAliases(candidate)
+	strictAliases := schedulerCandidateStrictAliases(candidate)
 	if len(aliases) == 0 {
 		return false, nil
 	}
 	var indexes []int
 	for i, ban := range bans {
-		for _, banAlias := range normalizeAccountAliases(ban.AuthID, ban.AuthIndex, ban.Source, ban.AuthFile) {
-			for _, alias := range aliases {
+		banAliases := normalizeAccountAliases(ban.AuthID, ban.AuthIndex, ban.Source, ban.AuthFile)
+		candidateAliases := aliases
+		if strict := strictAuthStateAliasesForValues(ban.AuthID, ban.AuthIndex, ban.Source, ban.AuthFile); len(strict) > 0 {
+			banAliases = strict
+			candidateAliases = strictAliases
+		}
+		for _, banAlias := range banAliases {
+			for _, alias := range candidateAliases {
 				if alias != "" && alias == banAlias {
 					indexes = append(indexes, i)
 					goto nextBan
@@ -2423,12 +2839,19 @@ func candidateMatchesActiveBanIndexes(candidate schedulerAuthCandidate, bans []a
 
 func candidateMatchesInvalidAuth(candidate schedulerAuthCandidate, invalids []invalidAuthRow) bool {
 	aliases := schedulerCandidateAliases(candidate)
+	strictAliases := schedulerCandidateStrictAliases(candidate)
 	if len(aliases) == 0 {
 		return false
 	}
 	for _, invalid := range invalids {
-		for _, invalidAlias := range normalizeAccountAliases(invalid.AuthID, invalid.AuthIndex, invalid.Source, invalid.AuthFile) {
-			for _, alias := range aliases {
+		invalidAliases := normalizeAccountAliases(invalid.AuthID, invalid.AuthIndex, invalid.Source, invalid.AuthFile)
+		candidateAliases := aliases
+		if strict := strictAuthStateAliasesForValues(invalid.AuthID, invalid.AuthIndex, invalid.Source, invalid.AuthFile); len(strict) > 0 {
+			invalidAliases = strict
+			candidateAliases = strictAliases
+		}
+		for _, invalidAlias := range invalidAliases {
+			for _, alias := range candidateAliases {
 				if alias != "" && alias == invalidAlias {
 					return true
 				}
@@ -2452,6 +2875,24 @@ func schedulerCandidateAliases(candidate schedulerAuthCandidate) []string {
 			stringFromAny(candidate.Metadata["file"]),
 		),
 	})
+}
+
+func schedulerCandidateStrictAliases(candidate schedulerAuthCandidate) []string {
+	authID := candidate.ID
+	authIndex := firstNonEmptyString(candidate.Attributes["auth_index"], stringFromAny(candidate.Metadata["auth_index"]))
+	source := firstNonEmptyString(candidate.Attributes["source"], stringFromAny(candidate.Metadata["source"]))
+	authFile := firstNonEmptyString(
+		candidate.Attributes["auth_file"],
+		stringFromAny(candidate.Metadata["auth_file"]),
+		candidate.Attributes["path"],
+		candidate.Attributes["file"],
+		stringFromAny(candidate.Metadata["path"]),
+		stringFromAny(candidate.Metadata["file"]),
+	)
+	if file := fileNameIfJSON(authFile); file != "" {
+		return normalizeAccountAliases(file, authIndex)
+	}
+	return strictAuthStateAliasesForValues(authID, authIndex, source, authFile)
 }
 
 func writeResponse(response *C.cliproxy_buffer, raw []byte) {

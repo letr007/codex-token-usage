@@ -332,7 +332,9 @@ func buildAuthDiagnostics(accounts []accountRow, invalidAuths []invalidAuthRow, 
 func count429Autobans(autobans []autobanRow) int {
 	count := 0
 	for _, ban := range autobans {
-		if strings.EqualFold(strings.TrimSpace(ban.Window), "401") || ban.LastStatusCode == http.StatusUnauthorized {
+		window := strings.TrimSpace(ban.Window)
+		if strings.EqualFold(window, "401") || strings.EqualFold(window, "402") || strings.EqualFold(window, "403") ||
+			ban.LastStatusCode == http.StatusUnauthorized || ban.LastStatusCode == http.StatusPaymentRequired || ban.LastStatusCode == http.StatusForbidden {
 			continue
 		}
 		count++
@@ -442,7 +444,9 @@ func buildAlerts(data map[string]any) []dashboardAlert {
 	}
 	if rows, ok := data["autobans"].([]autobanRow); ok {
 		for _, row := range rows {
-			if strings.EqualFold(strings.TrimSpace(row.Window), "401") || row.LastStatusCode == http.StatusUnauthorized {
+			window := strings.TrimSpace(row.Window)
+			if strings.EqualFold(window, "401") || strings.EqualFold(window, "402") || strings.EqualFold(window, "403") ||
+				row.LastStatusCode == http.StatusUnauthorized || row.LastStatusCode == http.StatusPaymentRequired || row.LastStatusCode == http.StatusForbidden {
 				continue
 			}
 			alerts = append(alerts, dashboardAlert{ID: "autoban:" + firstNonEmptyString(row.AuthID, row.AuthIndex, row.Source), Severity: "warning", Type: "429", Scope: "account", Target: firstNonEmptyString(row.Source, row.AuthID, row.AuthIndex), Message: "账号 429 自动禁用中", Detail: "恢复时间 " + row.ResetAtText, CreatedAt: row.BannedAtText, Active: row.Active})
@@ -490,7 +494,54 @@ func alertSeverityRank(value string) int {
 	}
 }
 
+type logExportFilter struct {
+	Window   string
+	Scope    string
+	Provider string
+	Account  string
+	Model    string
+	Date     string
+	Status   string
+	Limit    int
+}
+
+type logExportFilters = logExportFilter
+
 func handleExport(ctx context.Context, window, kind, format string, limit int) managementResponse {
+	return handleExportWithFilters(ctx, window, kind, format, limit, nil)
+}
+
+func handleExportWithFilters(ctx context.Context, window, kind, format string, limit int, query map[string][]string) managementResponse {
+	if strings.EqualFold(strings.TrimSpace(kind), "logs") {
+		db, _, err := globalStore.open(ctx)
+		if err != nil {
+			return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "open_failed", "message": err.Error()})
+		}
+		filters := logExportFilter{
+			Window:   window,
+			Scope:    firstQuery(query, "scope", "codex"),
+			Provider: firstQuery(query, "provider", ""),
+			Account:  firstQuery(query, "account", ""),
+			Model:    firstQuery(query, "model", ""),
+			Date:     firstQuery(query, "date", ""),
+			Status:   firstQuery(query, "status", "all"),
+			Limit:    limit,
+		}
+		records, headers, err := exportLogRecords(ctx, db, filters, defaultModelPrices())
+		if err != nil {
+			return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "export_failed", "message": err.Error()})
+		}
+		name := exportLogFileName(filters, format)
+		if strings.EqualFold(format, "json") {
+			body, _ := json.MarshalIndent(records, "", "  ")
+			return managementResponse{StatusCode: http.StatusOK, Headers: exportHeaders("application/json; charset=utf-8", name), Body: body}
+		}
+		body, err := recordsToCSV(headers, records)
+		if err != nil {
+			return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "export_failed", "message": err.Error()})
+		}
+		return managementResponse{StatusCode: http.StatusOK, Headers: exportHeaders("text/csv; charset=utf-8", name), Body: body}
+	}
 	data, err := globalSummaryPrecomputer.summary(ctx, globalStore, window, limit)
 	if err != nil {
 		return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "summary_failed", "message": err.Error()})
@@ -505,6 +556,51 @@ func handleExport(ctx context.Context, window, kind, format string, limit int) m
 		return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "export_failed", "message": err.Error()})
 	}
 	return managementResponse{StatusCode: http.StatusOK, Headers: exportHeaders("text/csv; charset=utf-8", kind+".csv"), Body: body}
+}
+
+func exportLogFileName(filters logExportFilter, format string) string {
+	scope := strings.ToLower(strings.TrimSpace(filters.Scope))
+	if scope == "" {
+		scope = "codex"
+	}
+	if scope == "provider" && strings.TrimSpace(filters.Provider) != "" {
+		scope = "provider-" + exportSafeFilePart(filters.Provider)
+	}
+	date := strings.TrimSpace(filters.Date)
+	if date == "" {
+		date = strings.ToLower(strings.TrimSpace(filters.Window))
+	}
+	if date == "" {
+		date = "all"
+	}
+	ext := "csv"
+	if strings.EqualFold(format, "json") {
+		ext = "json"
+	}
+	return "codex-token-usage-logs-" + exportSafeFilePart(scope) + "-" + exportSafeFilePart(date) + "." + ext
+}
+
+func exportSafeFilePart(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	var b strings.Builder
+	lastDash := false
+	for _, r := range value {
+		ok := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')
+		if ok {
+			b.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if !lastDash {
+			b.WriteByte('-')
+			lastDash = true
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	if out == "" {
+		return "all"
+	}
+	return out
 }
 
 func exportHeaders(contentType, name string) map[string][]string {
@@ -528,6 +624,173 @@ func exportRecords(data map[string]any, kind string) ([]map[string]string, []str
 	default:
 		return accountExportRows(anySlice[accountRow](data["accounts"])), []string{"account", "auth_index", "provider", "requests", "success_rate", "total_tokens", "cost_usd", "quota_total_estimate", "quota_remaining_estimate", "invalid_auth", "external_use_suspected", "last_seen"}
 	}
+}
+
+func exportLogRecords(ctx context.Context, db *sql.DB, filters logExportFilter, prices map[string]modelPrice) ([]map[string]string, []string, error) {
+	if filters.Limit <= 0 {
+		filters.Limit = 5000
+	}
+	if filters.Limit > 20000 {
+		filters.Limit = 20000
+	}
+	where := []string{}
+	args := []any{}
+	if strings.TrimSpace(filters.Date) != "" {
+		start, end, ok := localDateRange(filters.Date)
+		if ok {
+			where = append(where, "requested_at >= ?", "requested_at < ?")
+			args = append(args, start, end)
+		}
+	} else {
+		since, _ := windowStart(firstNonEmptyString(filters.Window, "24h"))
+		where = append(where, "requested_at >= ?")
+		args = append(args, since)
+	}
+	scope := strings.ToLower(strings.TrimSpace(filters.Scope))
+	switch scope {
+	case "providers", "provider":
+		where = append(where, usageScopeSQL("other"))
+	default:
+		where = append(where, usageScopeSQL("codex"))
+	}
+	providerExpr := cpaProviderSQL()
+	if provider := strings.TrimSpace(filters.Provider); provider != "" {
+		where = append(where, providerExpr+" = ?")
+		args = append(args, provider)
+	}
+	accountFilter := strings.TrimSpace(filters.Account)
+	maskedAccountFilter := strings.Contains(accountFilter, "****")
+	if account := normalizeAccountAlias(accountFilter); account != "" && !maskedAccountFilter {
+		where = append(where, `(lower(api_key)=? OR lower(auth_id)=? OR lower(auth_index)=? OR lower(source)=?)`)
+		args = append(args, account, account, account, account)
+	}
+	if model := normalizeAccountAlias(filters.Model); model != "" {
+		where = append(where, `(lower(model)=? OR lower(alias)=?)`)
+		args = append(args, model, model)
+	}
+	if status := strings.ToLower(strings.TrimSpace(filters.Status)); status != "" && status != "all" {
+		switch status {
+		case "success":
+			where = append(where, `(failed=0 AND (status_code=0 OR (status_code >= 200 AND status_code < 300)))`)
+		case "failed":
+			where = append(where, `(failed=1 OR status_code >= 400)`)
+		case "401", "402", "403", "429":
+			code, _ := strconv.Atoi(status)
+			where = append(where, `status_code=?`)
+			args = append(args, code)
+		case "5xx":
+			where = append(where, `status_code >= 500`)
+		}
+	}
+	query := `
+SELECT requested_at,
+CASE WHEN ` + usageScopeSQL("codex") + ` THEN 'codex' ELSE 'providers' END AS scope_key,
+` + providerExpr + ` AS provider_key,
+api_key, auth_id, auth_index, source, model, alias, reasoning_effort, service_tier,
+latency_ms, ttft_ms, status_code, failed, input_tokens, output_tokens, reasoning_tokens,
+cached_tokens, cache_read_tokens, cache_creation_tokens, total_tokens
+FROM usage_events
+WHERE ` + strings.Join(where, " AND ") + `
+ORDER BY requested_at DESC, id DESC
+LIMIT ?`
+	args = append(args, filters.Limit)
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	headers := []string{
+		"time", "scope", "provider", "account", "api_key", "auth_id", "auth_index", "source",
+		"model", "alias", "status_code", "failed", "input_tokens", "output_tokens", "cached_tokens",
+		"cache_read_tokens", "cache_creation_tokens", "reasoning_tokens", "total_tokens", "cost_usd",
+		"latency_ms", "ttft_ms", "output_tokens_per_second", "error_summary",
+	}
+	out := []map[string]string{}
+	for rows.Next() {
+		var ts int64
+		var scope, provider, apiKey, authID, authIndex, source, model, alias, reasoning, serviceTier string
+		var latency, ttft, input, output, reasoningTokens, cached, cacheRead, cacheCreation, total int64
+		var status, failedInt int
+		if err := rows.Scan(
+			&ts, &scope, &provider, &apiKey, &authID, &authIndex, &source, &model, &alias, &reasoning, &serviceTier,
+			&latency, &ttft, &status, &failedInt, &input, &output, &reasoningTokens, &cached, &cacheRead, &cacheCreation, &total,
+		); err != nil {
+			return nil, nil, err
+		}
+		costRow := costTokenRow{
+			Model:               model,
+			Alias:               alias,
+			Provider:            provider,
+			ServiceTier:         serviceTier,
+			InputTokens:         input,
+			OutputTokens:        output,
+			CachedTokens:        cached,
+			CacheReadTokens:     cacheRead,
+			CacheCreationTokens: cacheCreation,
+			TotalTokens:         total,
+		}
+		cost := 0.0
+		if value, ok := costForTokens(costRow, prices); ok {
+			cost = value
+		}
+		throughput := ""
+		if output > 0 {
+			ms := latency
+			if ttft > ms {
+				ms = ttft
+			}
+			if ms >= 1000 {
+				throughput = fmt.Sprintf("%.2f", float64(output)/(float64(ms)/1000.0))
+			}
+		}
+		failed := failedInt != 0
+		errorSummary := ""
+		if failed || status >= 400 {
+			if status == 0 {
+				status = 599
+			}
+			errorSummary = "http " + strconv.Itoa(status)
+		}
+		account := safeExportLabel(firstNonEmptyString(apiKey, authIndex, authID, source))
+		if maskedAccountFilter && account != accountFilter {
+			continue
+		}
+		out = append(out, map[string]string{
+			"time":                     unixTime(ts),
+			"scope":                    scope,
+			"provider":                 provider,
+			"account":                  account,
+			"api_key":                  safeExportLabel(apiKey),
+			"auth_id":                  safeExportLabel(authID),
+			"auth_index":               safeExportLabel(authIndex),
+			"source":                   safeExportLabel(source),
+			"model":                    model,
+			"alias":                    alias,
+			"status_code":              strconv.Itoa(status),
+			"failed":                   strconv.FormatBool(failed),
+			"input_tokens":             strconv.FormatInt(input, 10),
+			"output_tokens":            strconv.FormatInt(output, 10),
+			"cached_tokens":            strconv.FormatInt(cached, 10),
+			"cache_read_tokens":        strconv.FormatInt(cacheRead, 10),
+			"cache_creation_tokens":    strconv.FormatInt(cacheCreation, 10),
+			"reasoning_tokens":         strconv.FormatInt(reasoningTokens, 10),
+			"total_tokens":             strconv.FormatInt(total, 10),
+			"cost_usd":                 fmt.Sprintf("%.6f", cost),
+			"latency_ms":               strconv.FormatInt(latency, 10),
+			"ttft_ms":                  strconv.FormatInt(ttft, 10),
+			"output_tokens_per_second": throughput,
+			"error_summary":            errorSummary,
+		})
+	}
+	return out, headers, rows.Err()
+}
+
+func localDateRange(value string) (int64, int64, bool) {
+	date, err := time.ParseInLocation("2006-01-02", strings.TrimSpace(value), time.Local)
+	if err != nil {
+		return 0, 0, false
+	}
+	return date.Unix(), date.Add(24 * time.Hour).Unix(), true
 }
 
 func anySlice[T any](value any) []T {

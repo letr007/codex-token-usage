@@ -253,6 +253,45 @@ GROUP BY provider_key, model, alias, provider, service_tier`, since)
 	return nil
 }
 
+func applyKeySummaryCosts(ctx context.Context, db *sql.DB, since int64, keys []keySummaryRow, prices map[string]modelPrice) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	rows, err := db.QueryContext(ctx, `
+SELECT api_key, `+keyProtocolSQL()+` AS protocol_key, model, alias, `+cpaProviderSQL()+` AS provider_key, service_tier,
+COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(cached_tokens),0),
+COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_creation_tokens),0), COALESCE(SUM(total_tokens),0)
+FROM usage_events
+WHERE requested_at >= ? AND api_key <> ''
+GROUP BY api_key, protocol_key, model, alias, provider_key, service_tier`, since)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	costs := map[string]costSummary{}
+	for rows.Next() {
+		var rawKey, protocol string
+		var row costTokenRow
+		if err := rows.Scan(
+			&rawKey, &protocol, &row.Model, &row.Alias, &row.Provider, &row.ServiceTier,
+			&row.InputTokens, &row.OutputTokens, &row.CachedTokens, &row.CacheReadTokens, &row.CacheCreationTokens, &row.TotalTokens,
+		); err != nil {
+			return err
+		}
+		addCostSummary(costs, keySummaryGroupKey(rawKey, protocol), row, prices)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for i := range keys {
+		sum := costs[keySummaryGroupKey(keys[i].RawKeyID, keys[i].Protocol)]
+		keys[i].CostUSD = sum.CostUSD
+		keys[i].UnpricedTokens = sum.UnpricedTokens
+		keys[i].CostAvailable = costAvailable(keys[i].TotalTokens, sum.UnpricedTokens)
+	}
+	return nil
+}
+
 func applyModelCosts(ctx context.Context, db *sql.DB, since int64, models []modelRow, prices map[string]modelPrice, scope string) error {
 	rows, err := db.QueryContext(ctx, `
 SELECT model, alias, `+cpaProviderSQL()+` AS provider_key, service_tier,

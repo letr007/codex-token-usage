@@ -107,6 +107,23 @@ func TestDashboardLanguageSelectionPersistsAndIsNotTranslated(t *testing.T) {
 	}
 }
 
+func TestDashboardTranslationsCoverRuntimeDynamicFragments(t *testing.T) {
+	for _, snippet := range []string{
+		`['占比 ','share ']`,
+		`['慢TTFT ','slow TTFT ']`,
+		`[' 个自动禁用账号',' auto-banned accounts']`,
+		`[' 个接入点',' endpoints']`,
+		`'429 等待 reset_at，401/402 需处理认证文件':'429 waits for reset_at; 401/402 need credential handling'`,
+		`'当前没有自动禁用':'No active auto-bans'`,
+		`'429 最多':'Most 429s'`,
+		`'已配置':'Configured'`,
+	} {
+		if !strings.Contains(dashboardHTML, snippet) {
+			t.Fatalf("dashboardHTML missing runtime translation snippet %q", snippet)
+		}
+	}
+}
+
 func TestDashboardShowsAndSearchesChatGPTAccountID(t *testing.T) {
 	for _, snippet := range []string{
 		`r.chatgpt_account_id`,
@@ -203,6 +220,37 @@ func TestDashboardHasWorkspaceDeactivatedCardAndDeleteOnlyModal(t *testing.T) {
 	} {
 		if !strings.Contains(dashboardHTML, snippet) {
 			t.Fatalf("dashboardHTML missing workspace deactivated style %q", snippet)
+		}
+	}
+}
+
+func TestDashboardHasLogExportModalWithoutOldAccountExportButtons(t *testing.T) {
+	for _, absent := range []string{
+		`id="export-csv"`,
+		`id="export-json"`,
+		`导出账号 CSV`,
+		`导出账号 JSON`,
+	} {
+		if strings.Contains(dashboardHTML, absent) {
+			t.Fatalf("dashboardHTML still contains old account export entry %q", absent)
+		}
+	}
+	for _, snippet := range []string{
+		`id="export-logs"`,
+		`导出日志`,
+		`id="log-export-modal"`,
+		`id="log-export-account"`,
+		`id="log-export-provider"`,
+		`id="log-export-date"`,
+		`id="log-export-model"`,
+		`id="log-export-status"`,
+		`id="log-export-format"`,
+		`function openLogExportModal()`,
+		`function downloadLogExport()`,
+		`params.set('type','logs')`,
+	} {
+		if !strings.Contains(dashboardHTML, snippet) {
+			t.Fatalf("dashboardHTML missing log export snippet %q", snippet)
 		}
 	}
 }
@@ -492,6 +540,44 @@ func TestSchedulerPickRejectsAllBannedWithHTTPStatus(t *testing.T) {
 	}
 	if env.Error.Code != "auth_unavailable" || env.Error.HTTPStatus != http.StatusServiceUnavailable {
 		t.Fatalf("scheduler error = %+v, want auth_unavailable status 503", env.Error)
+	}
+}
+
+func TestMergeEffectiveAutobansDedupesUsageAndQuotaTriggerRows(t *testing.T) {
+	rows := []autobanRow{
+		{
+			AuthID:         "hamal526960+25563@gmail.com",
+			AuthIndex:      "hamal526960+25563@gmail-3.cpa.json",
+			Source:         "hamal526960+25563@gmail.com",
+			Window:         "5h",
+			Reason:         "primary 5h window is full",
+			BannedAt:       200,
+			ResetAt:        500,
+			LastStatusCode: http.StatusTooManyRequests,
+			Active:         true,
+		},
+		{
+			AuthID:         "hamal526960+25563@gmail-3.cpa.json",
+			AuthIndex:      "31b14d239d56c976",
+			Source:         "hamal526960+25563@gmail.com",
+			Window:         "5h",
+			Reason:         "backfilled: primary 5h window is full",
+			BannedAt:       100,
+			ResetAt:        499,
+			LastStatusCode: http.StatusTooManyRequests,
+			Active:         true,
+		},
+	}
+
+	got := mergeEffectiveAutobans(rows, nil)
+	if len(got) != 1 {
+		t.Fatalf("mergeEffectiveAutobans returned %d rows, want 1: %#v", len(got), got)
+	}
+	if got[0].AuthID != "hamal526960+25563@gmail-3.cpa.json" {
+		t.Fatalf("deduped ban AuthID = %q, want file-backed identity", got[0].AuthID)
+	}
+	if got[0].ResetAt != 500 {
+		t.Fatalf("deduped ban ResetAt = %d, want longest active reset 500", got[0].ResetAt)
 	}
 }
 
@@ -849,6 +935,153 @@ func TestCodex402SameEmailOnlyMarksMatchingAuthFile(t *testing.T) {
 	}
 	if len(marked) != 1 || marked[0] != "same-b.cpa.json" {
 		t.Fatalf("workspace-deactivated accounts = %#v, want only same-b.cpa.json", marked)
+	}
+}
+
+func TestCodex402SameEmailSuccessFromDifferentAuthFileDoesNotClearWorkspaceState(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	authDir := t.TempDir()
+	t.Setenv("CPA_AUTH_DIR", authDir)
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+
+	const email = "same-recovery@example.com"
+	for _, file := range []string{"same-recovery.cpa.json", "same-recovery-3.cpa.json"} {
+		raw, err := json.Marshal(map[string]any{
+			"email":              email,
+			"type":               "codex",
+			"access_token":       "secret",
+			"chatgpt_account_id": strings.TrimSuffix(file, ".cpa.json"),
+		})
+		if err != nil {
+			t.Fatalf("marshal %s: %v", file, err)
+		}
+		if err := os.WriteFile(filepath.Join(authDir, file), raw, 0600); err != nil {
+			t.Fatalf("write %s: %v", file, err)
+		}
+	}
+	base := time.Now().Add(-time.Minute)
+	if err := store.recordUsage(ctx, usageRecord{
+		Provider:    "codex",
+		AuthID:      email,
+		AuthIndex:   "same-recovery.cpa.json",
+		Source:      email,
+		RequestedAt: base,
+		Failed:      true,
+		Failure:     usageFailure{StatusCode: http.StatusPaymentRequired, Body: `{"detail":{"code":"deactivated_workspace"}}`},
+	}); err != nil {
+		t.Fatalf("record 402 usage: %v", err)
+	}
+	if err := store.recordUsage(ctx, usageRecord{
+		Provider:    "codex",
+		AuthID:      email,
+		AuthIndex:   "same-recovery-3.cpa.json",
+		Source:      email,
+		RequestedAt: base.Add(30 * time.Second),
+		Detail:      usageDetail{InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
+	}); err != nil {
+		t.Fatalf("record successful sibling usage: %v", err)
+	}
+
+	data, err := store.summary(ctx, "24h", 20)
+	if err != nil {
+		t.Fatalf("summary returned error: %v", err)
+	}
+	rows := data["workspace_deactivated_auths"].([]invalidAuthRow)
+	if len(rows) != 1 || rows[0].AuthFile != "same-recovery.cpa.json" {
+		t.Fatalf("workspace_deactivated_auths = %#v, want base auth file to remain active", rows)
+	}
+	accounts := data["accounts"].([]accountRow)
+	flagged := []string{}
+	for _, account := range accounts {
+		if account.WorkspaceDeactivated {
+			flagged = append(flagged, account.AuthFile)
+		}
+	}
+	if len(flagged) != 1 || flagged[0] != "same-recovery.cpa.json" {
+		t.Fatalf("workspace flags = %#v, want only base auth file", flagged)
+	}
+}
+
+func TestCodexRepeated403ProtectsOnlyMatchingAuthFile(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	authDir := t.TempDir()
+	t.Setenv("CPA_AUTH_DIR", authDir)
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+
+	const email = "same-forbidden@example.com"
+	for _, file := range []string{"same-forbidden.cpa.json", "same-forbidden-2.cpa.json", "same-forbidden-3.cpa.json"} {
+		raw, err := json.Marshal(map[string]any{
+			"email":              email,
+			"type":               "codex",
+			"access_token":       "secret",
+			"chatgpt_account_id": strings.TrimSuffix(file, ".cpa.json"),
+		})
+		if err != nil {
+			t.Fatalf("marshal %s: %v", file, err)
+		}
+		if err := os.WriteFile(filepath.Join(authDir, file), raw, 0600); err != nil {
+			t.Fatalf("write %s: %v", file, err)
+		}
+	}
+	base := time.Now().Add(-time.Minute)
+	for i := 0; i < forbiddenInvalidAuthThreshold; i++ {
+		if err := store.recordUsage(ctx, usageRecord{
+			Provider:    "codex",
+			AuthID:      email,
+			AuthIndex:   "same-forbidden-2.cpa.json",
+			Source:      email,
+			RequestedAt: base.Add(time.Duration(i) * time.Second),
+			Failed:      true,
+			Failure:     usageFailure{StatusCode: http.StatusForbidden},
+		}); err != nil {
+			t.Fatalf("record 403 usage %d: %v", i, err)
+		}
+	}
+	if err := store.recordUsage(ctx, usageRecord{
+		Provider:    "codex",
+		AuthID:      email,
+		AuthIndex:   "same-forbidden-3.cpa.json",
+		Source:      email,
+		RequestedAt: base.Add(time.Minute),
+		Detail:      usageDetail{InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
+	}); err != nil {
+		t.Fatalf("record sibling success: %v", err)
+	}
+
+	data, err := store.summary(ctx, "24h", 20)
+	if err != nil {
+		t.Fatalf("summary returned error: %v", err)
+	}
+	invalids := data["invalid_auths"].([]invalidAuthRow)
+	if len(invalids) != 1 || invalids[0].AuthFile != "same-forbidden-2.cpa.json" || invalids[0].LastStatusCode != http.StatusForbidden {
+		t.Fatalf("invalid_auths = %#v, want repeated 403 for only -2 auth file", invalids)
+	}
+	accounts := data["accounts"].([]accountRow)
+	flagged := []string{}
+	for _, account := range accounts {
+		if account.InvalidAuth {
+			flagged = append(flagged, account.AuthFile)
+		}
+	}
+	if len(flagged) != 1 || flagged[0] != "same-forbidden-2.cpa.json" {
+		t.Fatalf("invalid flags = %#v, want only -2 auth file", flagged)
+	}
+	resp, err := store.pickAuth(ctx, schedulerPickRequest{
+		Provider: "codex",
+		Candidates: []schedulerAuthCandidate{
+			{ID: "same-forbidden-2.cpa.json", Provider: "codex", Priority: 100, Attributes: map[string]string{"auth_file": "same-forbidden-2.cpa.json", "source": email}},
+			{ID: "same-forbidden-3.cpa.json", Provider: "codex", Priority: 90, Attributes: map[string]string{"auth_file": "same-forbidden-3.cpa.json", "source": email}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("pickAuth returned error: %v", err)
+	}
+	if !resp.Handled || resp.AuthID != "same-forbidden-3.cpa.json" {
+		t.Fatalf("pickAuth = %+v, want sibling candidate selected after filtering -2", resp)
 	}
 }
 
@@ -1405,6 +1638,62 @@ func TestSummaryHidesDeletedConfiguredCodexAccounts(t *testing.T) {
 	}
 }
 
+func TestSummaryHidesDeletedSameEmailAuthFileFromAccountPool(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	authDir := t.TempDir()
+	t.Setenv("CPA_AUTH_DIR", authDir)
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+
+	const email = "same-email@example.com"
+	currentAuth := filepath.Join(authDir, "same-email-3.cpa.json")
+	if err := os.WriteFile(currentAuth, []byte(`{"email":"same-email@example.com","type":"codex","access_token":"active-token","chatgpt_account_id":"workspace-3"}`), 0600); err != nil {
+		t.Fatalf("write current auth: %v", err)
+	}
+	if err := store.recordUsage(ctx, usageRecord{
+		Provider:    "codex",
+		AuthID:      "same-email-2.cpa.json",
+		AuthIndex:   "deleted-workspace-index",
+		Source:      email,
+		RequestedAt: time.Now().Add(-time.Hour),
+		Failed:      true,
+		Failure:     usageFailure{StatusCode: http.StatusForbidden},
+	}); err != nil {
+		t.Fatalf("record deleted same-email usage: %v", err)
+	}
+	if err := store.recordUsage(ctx, usageRecord{
+		Provider:    "codex",
+		AuthID:      "same-email-3.cpa.json",
+		AuthIndex:   "current-workspace-index",
+		Source:      email,
+		RequestedAt: time.Now(),
+		Detail:      usageDetail{InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
+	}); err != nil {
+		t.Fatalf("record current same-email usage: %v", err)
+	}
+
+	data, err := store.summary(ctx, "24h", 20)
+	if err != nil {
+		t.Fatalf("summary returned error: %v", err)
+	}
+	accounts := data["accounts"].([]accountRow)
+	for _, account := range accounts {
+		if strings.Contains(account.AuthID, "same-email-2.cpa.json") || strings.Contains(account.AuthIndex, "deleted-workspace-index") {
+			t.Fatalf("accounts = %#v, want deleted same-email auth file hidden from account pool", accounts)
+		}
+	}
+	foundCurrent := false
+	for _, account := range accounts {
+		if account.AuthFile == "same-email-3.cpa.json" || account.AuthID == "same-email-3.cpa.json" {
+			foundCurrent = true
+		}
+	}
+	if !foundCurrent {
+		t.Fatalf("accounts = %#v, want current same-email auth file visible", accounts)
+	}
+}
+
 func TestSummaryClearsDeletedConfiguredAuthState(t *testing.T) {
 	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
 	authDir := t.TempDir()
@@ -1454,6 +1743,159 @@ func TestSummaryClearsDeletedConfiguredAuthState(t *testing.T) {
 	}
 	if got := data["invalid_auths"].([]invalidAuthRow); len(got) != 0 {
 		t.Fatalf("invalid_auths = %#v, want deleted auth invalid cleared", got)
+	}
+}
+
+func TestSummaryClearsMissingFileBacked402EvenWhenSameEmailStillExists(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	authDir := t.TempDir()
+	t.Setenv("CPA_AUTH_DIR", authDir)
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+
+	const email = "same-deleted@example.com"
+	if err := os.WriteFile(filepath.Join(authDir, "same-deleted-3.cpa.json"), []byte(`{"email":"same-deleted@example.com","type":"codex","access_token":"secret","chatgpt_account_id":"workspace-3"}`), 0600); err != nil {
+		t.Fatalf("write remaining auth: %v", err)
+	}
+	db, _, err := store.open(ctx)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO invalid_auths (
+  auth_id, auth_index, source, provider, reason, invalidated_at, active, last_status_code, auth_file
+) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+		"same-deleted.cpa.json", "same-deleted.cpa.json", email, "codex",
+		"402 deactivated_workspace: team workspace is deactivated", time.Now().Add(-time.Minute).Unix(), http.StatusPaymentRequired, "same-deleted.cpa.json",
+	); err != nil {
+		t.Fatalf("insert invalid auth: %v", err)
+	}
+
+	data, err := store.summary(ctx, "24h", 20)
+	if err != nil {
+		t.Fatalf("summary returned error: %v", err)
+	}
+	if got := data["workspace_deactivated_auths"].([]invalidAuthRow); len(got) != 0 {
+		t.Fatalf("workspace_deactivated_auths = %#v, want deleted base file cleared even though same email remains", got)
+	}
+}
+
+func TestSummaryClearsLegacyEmailKeyedMissing402EvenWhenSameEmailStillExists(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	authDir := t.TempDir()
+	t.Setenv("CPA_AUTH_DIR", authDir)
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+
+	const email = "legacy-same-deleted@example.com"
+	remainingPath := filepath.Join(authDir, "legacy-same-deleted-3.cpa.json")
+	if err := os.WriteFile(remainingPath, []byte(`{"email":"legacy-same-deleted@example.com","type":"codex","access_token":"secret","chatgpt_account_id":"workspace-3"}`), 0600); err != nil {
+		t.Fatalf("write remaining auth: %v", err)
+	}
+	oldMod := time.Now().Add(-2 * time.Minute)
+	if err := os.Chtimes(remainingPath, oldMod, oldMod); err != nil {
+		t.Fatalf("age remaining auth: %v", err)
+	}
+	db, _, err := store.open(ctx)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO invalid_auths (
+  auth_id, auth_index, source, provider, reason, invalidated_at, active, last_status_code, auth_file
+) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+		email, "legacy-same-deleted.cpa.json", email, "codex",
+		"402 deactivated_workspace: team workspace is deactivated", time.Now().Add(-time.Minute).Unix(), http.StatusPaymentRequired, "legacy-same-deleted.cpa.json",
+	); err != nil {
+		t.Fatalf("insert legacy invalid auth: %v", err)
+	}
+
+	data, err := store.summary(ctx, "24h", 20)
+	if err != nil {
+		t.Fatalf("summary returned error: %v", err)
+	}
+	if got := data["workspace_deactivated_auths"].([]invalidAuthRow); len(got) != 0 {
+		t.Fatalf("workspace_deactivated_auths = %#v, want legacy email-keyed deleted base file cleared", got)
+	}
+}
+
+func TestSummaryClearsLegacyEmailKeyedMissing429EvenWhenSameEmailStillExists(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	authDir := t.TempDir()
+	t.Setenv("CPA_AUTH_DIR", authDir)
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+
+	const email = "legacy-same-429@example.com"
+	if err := os.WriteFile(filepath.Join(authDir, "legacy-same-429-3.cpa.json"), []byte(`{"email":"legacy-same-429@example.com","type":"codex","access_token":"secret","chatgpt_account_id":"workspace-3"}`), 0600); err != nil {
+		t.Fatalf("write remaining auth: %v", err)
+	}
+	db, _, err := store.open(ctx)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	resetAt := time.Now().Add(time.Hour).Unix()
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO autoban_bans (
+  auth_id, auth_index, source, provider, window, reason, banned_at, reset_at, active, last_status_code
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+		email, "legacy-same-429.cpa.json", email, "codex", "5h", "Primary quota exhausted",
+		time.Now().Add(-time.Minute).Unix(), resetAt, http.StatusTooManyRequests,
+	); err != nil {
+		t.Fatalf("insert legacy autoban: %v", err)
+	}
+
+	data, err := store.summary(ctx, "24h", 20)
+	if err != nil {
+		t.Fatalf("summary returned error: %v", err)
+	}
+	if got := data["autobans"].([]autobanRow); len(got) != 0 {
+		t.Fatalf("autobans = %#v, want legacy email-keyed deleted base file autoban cleared", got)
+	}
+}
+
+func TestSummaryDoesNotBackfillMissingFileBacked402FromQuotaTriggerHistory(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	authDir := t.TempDir()
+	t.Setenv("CPA_AUTH_DIR", authDir)
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+
+	const email = "same-trigger-deleted@example.com"
+	if err := os.WriteFile(filepath.Join(authDir, "same-trigger-deleted-3.cpa.json"), []byte(`{"email":"same-trigger-deleted@example.com","type":"codex","access_token":"secret","chatgpt_account_id":"workspace-3"}`), 0600); err != nil {
+		t.Fatalf("write remaining auth: %v", err)
+	}
+	db, _, err := store.open(ctx)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	at := time.Now().Add(-time.Minute).Unix()
+	if err := recordQuotaTriggerRun(ctx, db, quotaTriggerRun{
+		AuthID:     "same-trigger-deleted.cpa.json",
+		AuthIndex:  "same-trigger-deleted.cpa.json",
+		Source:     email,
+		Provider:   "codex",
+		AuthFile:   "same-trigger-deleted.cpa.json",
+		Mode:       "probe",
+		Status:     "failed",
+		HTTPStatus: http.StatusPaymentRequired,
+		Error:      "402 deactivated_workspace: team workspace is deactivated",
+		StartedAt:  at,
+		FinishedAt: at,
+	}); err != nil {
+		t.Fatalf("record quota trigger run: %v", err)
+	}
+
+	data, err := store.summary(ctx, "24h", 20)
+	if err != nil {
+		t.Fatalf("summary returned error: %v", err)
+	}
+	if got := data["workspace_deactivated_auths"].([]invalidAuthRow); len(got) != 0 {
+		t.Fatalf("workspace_deactivated_auths = %#v, want missing base auth file not resurrected from quota trigger history", got)
 	}
 }
 
@@ -3334,6 +3776,141 @@ codex-api-key:
 	}
 }
 
+func TestProviderRecentIsCappedPerEndpointWithoutDroppingQuietEndpoints(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	t.Setenv("CPA_AUTH_DIR", t.TempDir())
+	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
+	t.Setenv("CPA_CONFIG_PATH", cfgPath)
+	if err := os.WriteFile(cfgPath, []byte(`
+openai-compatibility:
+  - name: 字节
+    api-key: sk-byte-secret
+codex-api-key:
+  - name: Codex · api.kmoon.site
+    api-key: sk-codex-secret
+`), 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+	base := time.Now().Add(-2 * time.Hour)
+	if err := store.recordUsage(ctx, usageRecord{
+		Provider:    "openai-compatible-字节",
+		AuthID:      "openai-compatibility:字节:test",
+		AuthType:    "api_key",
+		Source:      "ark-byte-key",
+		Model:       "deepseek-v4-pro",
+		RequestedAt: base,
+		Detail:      usageDetail{InputTokens: 100, OutputTokens: 20, TotalTokens: 120},
+	}); err != nil {
+		t.Fatalf("record byte usage: %v", err)
+	}
+	for i := 0; i < 400; i++ {
+		if err := store.recordUsage(ctx, usageRecord{
+			Provider:    "codex",
+			AuthID:      "codex:apikey:test",
+			AuthType:    "apikey",
+			Source:      "sk-codex-secret",
+			Model:       "gpt-5.5",
+			RequestedAt: base.Add(time.Duration(i+1) * time.Second),
+			Detail:      usageDetail{InputTokens: int64(1000 + i), OutputTokens: 10, TotalTokens: int64(1010 + i)},
+		}); err != nil {
+			t.Fatalf("record codex api key usage %d: %v", i, err)
+		}
+	}
+	data, err := store.summary(ctx, "24h", 2000)
+	if err != nil {
+		t.Fatalf("summary returned error: %v", err)
+	}
+	recent := data["provider_recent"].([]recentRow)
+	if len(recent) > 120 {
+		t.Fatalf("provider_recent len=%d, want compact per-endpoint recent payload", len(recent))
+	}
+	var foundByte bool
+	for _, row := range recent {
+		if row.Provider == "字节" {
+			foundByte = true
+		}
+	}
+	if !foundByte {
+		t.Fatalf("provider_recent len=%d missing quiet 字节 endpoint: %#v", len(recent), recent)
+	}
+}
+
+func TestKeySummariesAggregateCPAExternalKeyAcrossEndpoints(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	t.Setenv("CPA_AUTH_DIR", t.TempDir())
+	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
+	t.Setenv("CPA_CONFIG_PATH", cfgPath)
+	if err := os.WriteFile(cfgPath, []byte(`
+codex-api-key:
+  - api-key: sk-upstream-codex
+    base-url: https://api.kmoon.site/v1
+openai-compatibility:
+  - name: maas
+    api-key: sk-upstream-maas
+`), 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	ctx := context.Background()
+	store := &store{}
+	defer store.close()
+	now := time.Now()
+	records := []usageRecord{
+		{
+			Provider:     "codex",
+			ExecutorType: "CodexExecutor",
+			AuthType:     "apikey",
+			APIKey:       "sk-211278",
+			AuthID:       "codex:apikey:abc",
+			AuthIndex:    "key-a",
+			Source:       "sk-upstream-codex",
+			Model:        "gpt-5.5",
+			Alias:        "gpt-5.5",
+			RequestedAt:  now,
+			Detail:       usageDetail{InputTokens: 100, OutputTokens: 50, TotalTokens: 150},
+		},
+		{
+			Provider:     "openai-compatible-maas",
+			ExecutorType: "OpenAICompatibilityExecutor",
+			AuthType:     "api_key",
+			APIKey:       "sk-211278",
+			AuthID:       "openai-compatibility:maas:key",
+			AuthIndex:    "key-b",
+			Source:       "sk-upstream-maas",
+			Model:        "deepseek-v4-pro",
+			Alias:        "deepseek-v4-pro",
+			RequestedAt:  now.Add(time.Second),
+			Detail:       usageDetail{InputTokens: 200, OutputTokens: 150, TotalTokens: 350},
+		},
+	}
+	for i, rec := range records {
+		if err := store.recordUsage(ctx, rec); err != nil {
+			t.Fatalf("recordUsage %d returned error: %v", i, err)
+		}
+	}
+
+	data, err := store.summary(ctx, "24h", 20)
+	if err != nil {
+		t.Fatalf("summary returned error: %v", err)
+	}
+	rows := data["key_summaries"].([]keySummaryRow)
+	if len(rows) != 1 {
+		t.Fatalf("key_summaries = %#v, want one CPA external key row", rows)
+	}
+	row := rows[0]
+	if row.KeyID != "sk-****1278" || row.Protocol != "apikey" {
+		t.Fatalf("key summary identity = %+v, want masked sk-211278 and apikey protocol", row)
+	}
+	if row.Providers != 2 || !strings.Contains(row.ProviderNames, "Codex · api.kmoon.site") || !strings.Contains(row.ProviderNames, "maas") {
+		t.Fatalf("key summary providers = %+v, want both endpoint names", row)
+	}
+	if row.TotalTokens != 500 || row.Models != 2 {
+		t.Fatalf("key summary totals = %+v, want 500 tokens and two models", row)
+	}
+}
+
 func TestConfiguredProviderNamesFromYAMLReadsOpenAICompatibilityNames(t *testing.T) {
 	raw := `
 openai-compatibility:
@@ -3583,6 +4160,100 @@ func TestExportRecordsDoNotLeakSecrets(t *testing.T) {
 	}
 	if strings.Contains(string(body), "sk-secret-should-not-export") {
 		t.Fatalf("recent export leaked secret: %s", body)
+	}
+}
+
+func TestExportLogRecordsFiltersAndRedactsSecrets(t *testing.T) {
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	t.Setenv("CPA_AUTH_DIR", t.TempDir())
+	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
+	t.Setenv("CPA_CONFIG_PATH", cfgPath)
+	if err := os.WriteFile(cfgPath, []byte(`
+codex-api-key:
+  - api-key: sk-upstream-codex
+    base-url: https://api.kmoon.site/v1
+openai-compatibility:
+  - name: maas
+    api-key: sk-upstream-maas
+`), 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	store := &store{}
+	defer store.close()
+	ctx := context.Background()
+	day := time.Date(2026, 7, 4, 10, 30, 0, 0, time.Local)
+	records := []usageRecord{
+		{
+			Provider:     "codex",
+			ExecutorType: "CodexExecutor",
+			AuthType:     "apikey",
+			APIKey:       "sk-211278",
+			AuthID:       "codex:apikey:abc",
+			AuthIndex:    "key-a",
+			Source:       "sk-upstream-codex",
+			Model:        "gpt-5.5",
+			Alias:        "gpt-5.5",
+			RequestedAt:  day,
+			Detail:       usageDetail{InputTokens: 100, OutputTokens: 50, TotalTokens: 150},
+		},
+		{
+			Provider:     "openai-compatible-maas",
+			ExecutorType: "OpenAICompatibilityExecutor",
+			AuthType:     "api_key",
+			APIKey:       "sk-other-key",
+			AuthID:       "openai-compatibility:maas:key",
+			Source:       "sk-upstream-maas",
+			Model:        "deepseek-v4-pro",
+			RequestedAt:  day.Add(time.Hour),
+			Failed:       true,
+			Failure:      usageFailure{StatusCode: http.StatusTooManyRequests},
+		},
+		{
+			Provider:    "codex",
+			AuthType:    "oauth",
+			AuthID:      "oauth@example.com.cpa.json",
+			AuthIndex:   "oauth@example.com.cpa.json",
+			Source:      "oauth@example.com",
+			Model:       "gpt-5.5",
+			RequestedAt: day,
+			Detail:      usageDetail{InputTokens: 200, OutputTokens: 10, TotalTokens: 210},
+		},
+	}
+	for i, rec := range records {
+		if err := store.recordUsage(ctx, rec); err != nil {
+			t.Fatalf("recordUsage %d returned error: %v", i, err)
+		}
+	}
+	db, _, err := store.open(ctx)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	rows, headers, err := exportLogRecords(ctx, db, logExportFilter{
+		Scope:    "provider",
+		Provider: "Codex · api.kmoon.site",
+		Account:  "sk-211278",
+		Model:    "gpt-5.5",
+		Date:     "2026-07-04",
+		Status:   "success",
+		Limit:    100,
+	}, defaultModelPrices())
+	if err != nil {
+		t.Fatalf("exportLogRecords returned error: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("exported rows = %#v, want only matching provider/key/model/day success row", rows)
+	}
+	if rows[0]["provider"] != "Codex · api.kmoon.site" || rows[0]["model"] != "gpt-5.5" || rows[0]["status_code"] != "0" {
+		t.Fatalf("exported row = %#v, want matching Codex endpoint model", rows[0])
+	}
+	body, err := recordsToCSV(headers, rows)
+	if err != nil {
+		t.Fatalf("recordsToCSV returned error: %v", err)
+	}
+	for _, secret := range []string{"sk-211278", "sk-upstream-codex", "sk-other-key", "Bearer "} {
+		if strings.Contains(string(body), secret) {
+			t.Fatalf("log export leaked %q: %s", secret, body)
+		}
 	}
 }
 

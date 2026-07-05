@@ -17,6 +17,8 @@ const invalidAuthStatusEl=document.getElementById('invalid-auth-status');
 const invalidAuthOAuthUrlEl=document.getElementById('invalid-auth-oauth-url');
 const workspaceDeactivatedModal=document.getElementById('workspace-deactivated-modal');
 const workspaceDeactivatedStatusEl=document.getElementById('workspace-deactivated-status');
+const logExportModal=document.getElementById('log-export-modal');
+const logExportStatusEl=document.getElementById('log-export-status-text');
 const cpaStoragePrefix='enc::v1::';
 const cpaSecureStorageSalt='cli-proxy-api-webui::secure-storage';
 let lastData=null;
@@ -45,13 +47,13 @@ initLanguageControl();
 initBatchProxyControl();
 initInvalidAuthControl();
 initWorkspaceDeactivatedControl();
+initLogExportControl();
 initUIPreferences();
 applyHostTheme();
 observeHostTheme();
 document.getElementById('refresh').onclick=load;
 document.getElementById('window').onchange=e=>{safeStorageSet(safeLocalStorage(),'cpa_token_usage_window',e.target.value);load()};
-document.getElementById('export-csv').onclick=()=>downloadExport('csv');
-document.getElementById('export-json').onclick=()=>downloadExport('json');
+document.getElementById('export-logs').onclick=openLogExportModal;
 document.getElementById('tab-strip').addEventListener('click',e=>{const btn=e.target.closest('.tab[data-target]');if(btn)switchPage(btn.dataset.target)});
 document.getElementById('provider-picker-button').onclick=()=>document.getElementById('provider-picker').classList.toggle('open');
 document.addEventListener('click',e=>{const picker=document.getElementById('provider-picker');if(!picker.contains(e.target))picker.classList.remove('open')});
@@ -91,23 +93,89 @@ function applyAccountColumns(){
     document.body.classList.toggle('hide-account-'+input.dataset.col,!on);
   });
 }
-function exportType(){return 'accounts'}
-async function downloadExport(format){
-  const params='?window='+encodeURIComponent(document.getElementById('window').value)+'&limit=5000&type='+encodeURIComponent(exportType())+'&format='+encodeURIComponent(format);
+function currentLogExportScope(){
+  if(activePage==='codex')return {scope:'codex',provider:''};
+  if(activePage==='providers')return {scope:'providers',provider:''};
+  const page=document.querySelector('.tab[data-target="'+activePage+'"]');
+  return {scope:'provider',provider:page?firstText(page.childNodes[0]&&page.childNodes[0].nodeValue,page.textContent).replace(/\\s*[0-9.,KMB]+$/,''):''};
+}
+function initLogExportControl(){
+  document.getElementById('log-export-close').onclick=closeLogExportModal;
+  document.getElementById('log-export-close-bottom').onclick=closeLogExportModal;
+  document.getElementById('log-export-apply').onclick=downloadLogExport;
+  logExportModal.addEventListener('click',e=>{if(e.target===logExportModal)closeLogExportModal()});
+  document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!logExportModal.hidden)closeLogExportModal()});
+}
+function openLogExportModal(){
+  populateLogExportFilters();
+  setLogExportStatus('按当前页面范围导出请求日志。','');
+  logExportModal.hidden=false;
+  setTimeout(()=>document.getElementById('log-export-account').focus(),0);
+}
+function closeLogExportModal(){logExportModal.hidden=true}
+function setLogExportStatus(text,tone){logExportStatusEl.classList.remove('ok','warn','bad');if(tone)logExportStatusEl.classList.add(tone);logExportStatusEl.textContent=tr(text)}
+function populateSelect(id,values,allLabel){
+  const el=document.getElementById(id);
+  const current=el.value;
+  const opts=['<option value="">'+esc(tr(allLabel))+'</option>'].concat([...new Set(values.filter(Boolean))].sort((a,b)=>a.localeCompare(b)).map(v=>'<option value="'+esc(v)+'">'+esc(v)+'</option>'));
+  el.innerHTML=opts.join('');
+  if(values.includes(current))el.value=current;
+}
+function logExportContextRows(){
+  const data=lastData||{};
+  const ctx=currentLogExportScope();
+  if(ctx.scope==='codex')return {accounts:data.accounts||[],recent:data.recent||[],providers:[],models:data.models||[]};
+  if(ctx.scope==='provider'){
+    const name=ctx.provider;
+    return {
+      accounts:(data.key_summaries||[]).filter(r=>(r.provider_names||r.provider||'').includes(name)),
+      recent:(data.provider_recent||[]).filter(r=>providerEquals(r,name)),
+      providers:(data.providers||[]).filter(r=>providerEquals(r,name)),
+      models:(data.provider_models||[]).filter(r=>providerEquals(r,name))
+    };
+  }
+  return {accounts:data.key_summaries||[],recent:data.provider_recent||[],providers:data.providers||[],models:data.provider_models||[]};
+}
+function populateLogExportFilters(){
+  const rows=logExportContextRows();
+  populateSelect('log-export-account',rows.accounts.map(r=>firstText(r.key_id,r.auth_file,r.auth_index,r.email,r.source,r.auth_id,r.name)), '全部账号');
+  populateSelect('log-export-provider',rows.providers.map(r=>r.provider).concat(rows.recent.map(r=>r.provider)), '全部接入点');
+  populateSelect('log-export-model',rows.models.map(r=>r.model).concat(rows.recent.map(r=>firstText(r.alias,r.model))), '全部模型');
+  const ctx=currentLogExportScope();
+  if(ctx.scope==='provider'&&ctx.provider)document.getElementById('log-export-provider').value=ctx.provider;
+}
+async function downloadLogExport(){
+  const ctx=currentLogExportScope();
+  const format=document.getElementById('log-export-format').value||'csv';
+  const params=new URLSearchParams();
+  params.set('window',document.getElementById('window').value);
+  params.set('limit','20000');
+  params.set('type','logs');
+  params.set('format',format);
+  params.set('scope',ctx.scope);
+  const provider=firstText(document.getElementById('log-export-provider').value,ctx.provider);
+  if(provider)params.set('provider',provider);
+  for(const pair of [['account','log-export-account'],['date','log-export-date'],['model','log-export-model'],['status','log-export-status']]){
+    const value=document.getElementById(pair[1]).value;
+    if(value)params.set(pair[0],value);
+  }
   const key=managementKey();
-  if(!key){showFallbackKeyInput();document.getElementById('status').textContent=tr('请填写备用 CPA 管理密钥后导出。');return}
+  if(!key){showFallbackKeyInput();setLogExportStatus('请填写备用 CPA 管理密钥后导出。','warn');return}
   safeStorageSet(safeSessionStorage(),'cpa_token_usage_key',key);
-  const res=await fetch(managementExportApi+params,{headers:{Authorization:'Bearer '+key}});
+  setLogExportStatus('正在导出日志...','');
+  const res=await fetch(managementExportApi+'?'+params.toString(),{headers:{Authorization:'Bearer '+key}});
   if(!res.ok){
     if(res.status===401)rejectManagementKey(key);
-    document.getElementById('status').textContent=tr('导出失败：')+res.status;
+    setLogExportStatus('导出失败：'+res.status,'bad');
     return;
   }
   const blob=await res.blob();
   const url=URL.createObjectURL(blob);
   const a=document.createElement('a');
-  a.href=url; a.download='codex-token-usage-'+exportType()+'.'+format; document.body.appendChild(a); a.click(); a.remove();
+  const date=document.getElementById('log-export-date').value||document.getElementById('window').value;
+  a.href=url; a.download='codex-token-usage-logs-'+ctx.scope+'-'+date+'.'+format; document.body.appendChild(a); a.click(); a.remove();
   URL.revokeObjectURL(url);
+  setLogExportStatus('导出完成。','ok');
 }
 function languageStorageKey(){return 'cpa_token_usage_language'}
 function safeLocalStorage(){try{return window.localStorage}catch(e){return null}}
@@ -364,11 +432,26 @@ function workspaceDeactivatedRows(){
   return out;
 }
 function sameAuthIdentity(a,b){
+  const strictA=strictAuthAliases(a);
+  const strictB=strictAuthAliases(b);
+  if(strictA.length||strictB.length){
+    const set=new Set(strictA);
+    return strictB.some(v=>set.has(v));
+  }
   const aliases=new Set(accountAliases(a));
   return accountAliases(b).some(v=>aliases.has(v));
 }
 function accountAliases(r){
   return [r&&r.auth_id,r&&r.auth_index,r&&r.source,r&&r.email,r&&r.name,r&&r.auth_file].flatMap(authAliasVariants).filter(Boolean);
+}
+function strictAuthAliases(r){
+  const values=[r&&r.auth_file,r&&r.chatgpt_account_id];
+  ['auth_id','auth_index','source'].forEach(k=>{
+    const v=String((r&&r[k])||'').trim();
+    if(/\.json$/i.test(fileNameOnly(v)))values.push(v);
+  });
+  if(r&&r.auth_file&&r.auth_index)values.push(r.auth_index);
+  return values.flatMap(authAliasVariants).filter(Boolean);
 }
 function authAliasVariants(value){
   value=String(value||'').trim().toLowerCase();
@@ -971,6 +1054,25 @@ const i18nEn={
   '最近 30 天':'Last 30 days',
   '全部':'All',
   '刷新':'Refresh',
+  '导出日志':'Export logs',
+  '关闭导出日志':'Close log export',
+  '账号':'Account',
+  '全部账号':'All accounts',
+  '接入点':'Endpoint',
+  '全部接入点':'All endpoints',
+  '日期':'Date',
+  '全部模型':'All models',
+  '状态':'Status',
+  '全部状态':'All statuses',
+  '格式':'Format',
+  '按当前页面范围导出请求日志。':'Export request logs for the current page scope.',
+  '正在导出日志...':'Exporting logs...',
+  '导出完成。':'Export complete.',
+  'CPA 多 Key 用量':'CPA multi-key usage',
+  '按 CPA 对外 Key 聚合模型、协议和 Token 额度':'Aggregated by CPA external key, model, protocol, and token usage',
+  '协议':'Protocol',
+  'Token / 费用':'Tokens / cost',
+  '暂无 Key 数据':'No key data',
   '统计页面':'Usage pages',
   'Codex 账号池':'Codex accounts',
   'AI 总览':'AI overview',
@@ -1001,6 +1103,7 @@ const i18nEn={
   '默认关闭':'Off by default',
   'Top 账号占比':'Top account share',
   'Token 集中度':'Token concentration',
+  '429 最多':'Most 429s',
   '平均耗时':'Avg latency',
   '慢请求 -':'Slow requests -',
   '首 Token':'First token',
@@ -1055,6 +1158,7 @@ const i18nEn={
   '点击处理':'Resolve',
   '无 401':'No 401',
   '无 402':'No 402',
+  '已配置':'Configured',
   '管理 401 失效账号':'Manage 401 invalid accounts',
   '管理 402 工作区失效账号':'Manage 402 deactivated workspace accounts',
   '关闭 401 管理':'Close 401 manager',
@@ -1218,6 +1322,8 @@ const i18nEn={
   '推理':'Reasoning',
   '当前没有 429 ban':'No active 429 bans',
   '等待 reset_at 自动放回':'Waiting for reset_at release',
+  '429 等待 reset_at，401/402 需处理认证文件':'429 waits for reset_at; 401/402 need credential handling',
+  '当前没有自动禁用':'No active auto-bans',
   '已停止使用，替换或删除 json 后解除':'Stopped. Replace or delete the JSON to release.',
   '当前没有失效 json':'No invalid JSON credentials',
   '未发现一号多卖迹象':'No shared-account signal found',
@@ -1233,12 +1339,12 @@ function tr(text){
   const exact=(zh,en)=>{out=out.split(zh).join(en)};
   [
     ['成功率 ','Success '],['缓存率 ','Cache rate '],['占总 ','total share '],['占 ','share '],
-    ['覆盖 ','Covers '],[' 个账号',' accounts'],['总额 ','total '],['模式 ','mode '],
+    ['占比 ','share '],['覆盖 ','Covers '],[' 个自动禁用账号',' auto-banned accounts'],[' 个接入点',' endpoints'],[' 个账号',' accounts'],['总额 ','total '],['模式 ','mode '],
     ['成功 ','success '],['失败 ','failed '],['跳过','skipped'],['最近 ','Recent '],
     ['显示 ','Showing '],['，已加载 ',', loaded '],['已加载 ','loaded '],
     ['外部消耗 ','external use '],['本地 ','local '],['输入 ','input '],['输出 ','output '],
     ['缓存 ↓ ','cache ↓ '],['推理 ','reasoning '],['余 ','remaining '],['总 ','total '],['已用 ','used '],
-    ['耗时 ','latency '],['首包 ','TTFT '],['慢请求 ','slow req '],['慢首包 ','slow TTFT '],
+    ['耗时 ','latency '],['慢首包 ','slow TTFT '],['慢TTFT ','slow TTFT '],['首包 ','TTFT '],['慢请求 ','slow req '],
     ['失败 ','failed '],['次',' times'],['天','d'],['小时','h'],['分','m'],['窗口：','Window: '],
     ['数据库：','DB: '],['更新时间：','Updated: '],['请填写备用 CPA 管理密钥后刷新。','Enter the fallback CPA management key and refresh.'],
     ['备用管理密钥不正确，已清除临时保存值。','Fallback management key is incorrect. The temporary value was cleared.'],
@@ -1346,7 +1452,7 @@ function health(v){v=Number(v||0); return v>=90?'danger':v>=70?'warn':'ok'}
 function successRate(r){return ratio((r.requests||0)-(r.failed||0),r.requests||0)}
 function resetText(ts){if(!ts)return '未捕获重置时间'; const n=Number(ts); const ms=n>1e12?n:n*1000; const d=new Date(ms); return isNaN(d.getTime())?'未捕获重置时间':'重置 '+d.toLocaleString()}
 function duration(sec){sec=Math.max(0,Number(sec||0)); const d=Math.floor(sec/86400), h=Math.floor(sec%86400/3600), m=Math.floor(sec%3600/60); return d?d+'天 '+h+'小时':h?h+'小时 '+m+'分':m+'分'}
-function isInvalidAuthBan(r){return String(r&&r.window||'').toLowerCase()==='401'||Number(r&&r.last_status_code)===401}
+function isInvalidAuthBan(r){const w=String(r&&r.window||'').toLowerCase();const code=Number(r&&r.last_status_code);return w==='401'||w==='403'||code===401||code===403}
 function isWorkspaceDeactivatedBan(r){return String(r&&r.window||'').toLowerCase()==='402'||Number(r&&r.last_status_code)===402}
 function isPermanentAuthBan(r){return isInvalidAuthBan(r)||isWorkspaceDeactivatedBan(r)}
 function autobanResetText(r){return isWorkspaceDeactivatedBan(r)?'删除或替换认证文件后解除':isInvalidAuthBan(r)?'重新登录后解除':(r.reset_at_text||'-')}
@@ -1466,6 +1572,7 @@ function renderProviderPage(data){
   renderTokenMix('provider-token-mix',t);
   renderTrend('provider-trend',data.provider_trend||[]);
   renderProviders(data.providers||[],total);
+  renderKeySummaries(data.key_summaries||[]);
   renderModels('provider-models',data.provider_models||[]);
   renderRecent('provider-recent',(data.provider_recent||[]).slice(0,30),'provider');
 }
@@ -1592,7 +1699,7 @@ function renderAccounts(){
 }
 function findBan(r){
   const bans=(lastData&&lastData.autobans)||[];
-  return bans.find(b=>(b.auth_id&&b.auth_id===r.auth_id)||(b.auth_index&&b.auth_index===r.auth_index)||(b.source&&b.source===r.source));
+  return bans.find(b=>sameAuthIdentity(b,r));
 }
 function accountName(r){return r.email||r.source||r.name||r.auth_id||r.auth_file||r.auth_index||'unknown'}
 function maxQuota(r){return Math.max(r.primary_used_percent||0,r.secondary_used_percent||0)}
@@ -1673,6 +1780,25 @@ function renderProviders(rows,total){
     td(perfCell(r),'num')+td(meterCell(compact(r.total_tokens),ratio(r.total_tokens,total),'var(--blue)'),'num')+td(costCell(r),'num')+td(compact(r.input_tokens),'num')+td(compact(r.output_tokens),'num')+
     td(compact(cacheTokens(r)),'num')+td(pct(cacheRate(r)),'num')+td(fmt(r.accounts||0),'num')+td(fmt(r.models||0),'num')+
     td(fmt(r.rate_limited||0),'num')+td(esc(r.last_seen||'-'))+'</tr>').join('') || '<tr><td colspan="14" class="muted">暂无 Provider 数据</td></tr>';
+}
+function renderKeySummaries(rows){
+  const target=document.getElementById('key-summaries');
+  if(!target)return;
+  target.innerHTML=rows.map(r=>{
+    const ok=(r.requests||0)-(r.failed||0);
+    const providers=firstText(r.provider_names,r.provider,'-');
+    return '<tr>'+
+      td('<span class="pill">'+esc(r.key_id||'-')+'</span>')+
+      td('<span class="pill">'+esc(r.protocol||'-')+'</span>')+
+      td('<span class="metric-stack"><b title="'+esc(providers)+'">'+esc(providers)+'</b><span>'+fmt(r.providers||0)+' 个接入点</span></span>')+
+      td(fmt(r.requests),'num')+
+      td(pct(ratio(ok,r.requests)),'num')+
+      td('<span class="metric-stack"><b>'+compact(r.total_tokens)+'</b><span>'+money(r.cost_usd)+'</span></span>','num')+
+      td(fmt(r.models||0),'num')+
+      td('<span class="'+((r.rate_limited||0)>0?'danger':'ok')+'">'+fmt(r.rate_limited||0)+'</span>','num')+
+      td(esc(r.last_seen||'-'))+
+    '</tr>';
+  }).join('') || '<tr><td colspan="9" class="muted">暂无 Key 数据</td></tr>';
 }
 function costCell(r){return r.cost_available||Number(r.cost_usd||0)>0?'<span class="'+(r.cost_available?'ok':'muted')+'">'+money(r.cost_usd)+'</span>':'<span class="muted">缺价格</span>'}
 function renderInsights(data){
