@@ -62,10 +62,15 @@ CREATE TABLE IF NOT EXISTS summary_cache (
   limit_count INTEGER NOT NULL DEFAULT 0,
   cached_at INTEGER NOT NULL DEFAULT 0,
   duration_ms INTEGER NOT NULL DEFAULT 0,
+  revision TEXT NOT NULL DEFAULT '',
   last_error TEXT NOT NULL DEFAULT '',
   data_json TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_summary_cache_cached_at ON summary_cache(cached_at);
+CREATE TABLE IF NOT EXISTS store_state (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS autoban_bans (
   auth_id TEXT PRIMARY KEY,
   auth_index TEXT NOT NULL DEFAULT '',

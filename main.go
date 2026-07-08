@@ -67,7 +67,7 @@ const (
 )
 
 var (
-	pluginVersion    = "0.1.19"
+	pluginVersion    = "0.1.20"
 	pluginAuthor     = "Codex Token Usage Contributors"
 	pluginRepository = "https://github.com/zhumengling/codex-token-usage"
 )
@@ -127,21 +127,25 @@ type lifecycleRequest struct {
 }
 
 type pluginConfig struct {
-	QuotaTriggerEnabled                   bool
-	QuotaTriggerIntervalMinutes           int
-	QuotaTriggerMode                      string
-	QuotaTriggerMaxConcurrency            int
-	QuotaTriggerTimeoutSeconds            int
-	QuotaTriggerMinAccountCooldownMinutes int
-	ModelPriceAutoUpdateEnabled           bool
-	ModelPriceUpdateIntervalHours         int
-	ModelPriceUpdateURL                   string
-	ModelPriceUpdateTimeoutSeconds        int
-	UsageRetentionDays                    int
-	QuotaTriggerRetentionDays             int
-	RequestDetailRetentionDays            int
-	SummaryPrecomputeEnabled              bool
-	SummaryPrecomputeIntervalSeconds      int
+	QuotaTriggerEnabled                     bool
+	QuotaTriggerIntervalMinutes             int
+	QuotaTriggerMode                        string
+	QuotaTriggerMaxConcurrency              int
+	QuotaTriggerTimeoutSeconds              int
+	QuotaTriggerMinAccountCooldownMinutes   int
+	ModelPriceAutoUpdateEnabled             bool
+	ModelPriceUpdateIntervalHours           int
+	ModelPriceUpdateURL                     string
+	ModelPriceUpdateTimeoutSeconds          int
+	UsageRetentionDays                      int
+	QuotaTriggerRetentionDays               int
+	RequestDetailRetentionDays              int
+	SummaryPrecomputeEnabled                bool
+	SummaryPrecomputeIntervalSeconds        int
+	SummaryPrecomputeMode                   string
+	SummaryCacheMaxAgeSeconds               int
+	SummaryMaintenanceIntervalSeconds       int
+	SummaryPrecomputeActiveWindowTTLSeconds int
 }
 
 type quotaTriggerState struct {
@@ -412,7 +416,11 @@ func pluginConfigFields() []configField {
 		{Name: "额度触发记录保留天数", Type: "number", Description: "quota_trigger_runs 保留天数，单位天。默认 30。"},
 		{Name: "请求明细保留天数", Type: "number", Description: "请求明细保留天数，当前随 usage_events 保守保留。默认 30。"},
 		{Name: "开启后台预计算", Type: "boolean", Description: "是否后台预热常用 summary，减少页面首次等待。默认开启。"},
-		{Name: "预计算间隔秒数", Type: "number", Description: "后台 summary 预热间隔，单位秒。默认 30。"},
+		{Name: "预计算间隔秒数", Type: "number", Description: "后台 summary 预热间隔，单位秒。默认 30；低占用模式下只检查活跃脏窗口。"},
+		{Name: "summary_precompute_mode", Type: "enum", Description: "active_dirty=只刷新活跃且变脏窗口；legacy=按旧逻辑刷新全部默认窗口。默认 active_dirty。"},
+		{Name: "summary_cache_max_age_seconds", Type: "number", Description: "相同数据 revision 下 summary 缓存最大复用秒数。默认 5。"},
+		{Name: "summary_maintenance_interval_seconds", Type: "number", Description: "后台状态维护间隔，单位秒；无数据变化会跳过。默认 180。"},
+		{Name: "summary_precompute_active_window_ttl_seconds", Type: "number", Description: "窗口被访问后保留为活跃预计算窗口的时间。默认 600。"},
 	}
 }
 
@@ -503,21 +511,25 @@ func parseInt(value string, fallback, min, max int) int {
 
 func defaultPluginConfig() pluginConfig {
 	return pluginConfig{
-		QuotaTriggerEnabled:                   false,
-		QuotaTriggerIntervalMinutes:           10,
-		QuotaTriggerMode:                      "probe",
-		QuotaTriggerMaxConcurrency:            1,
-		QuotaTriggerTimeoutSeconds:            20,
-		QuotaTriggerMinAccountCooldownMinutes: 10,
-		ModelPriceAutoUpdateEnabled:           true,
-		ModelPriceUpdateIntervalHours:         6,
-		ModelPriceUpdateURL:                   defaultModelPriceURL,
-		ModelPriceUpdateTimeoutSeconds:        20,
-		UsageRetentionDays:                    90,
-		QuotaTriggerRetentionDays:             30,
-		RequestDetailRetentionDays:            30,
-		SummaryPrecomputeEnabled:              true,
-		SummaryPrecomputeIntervalSeconds:      30,
+		QuotaTriggerEnabled:                     false,
+		QuotaTriggerIntervalMinutes:             10,
+		QuotaTriggerMode:                        "probe",
+		QuotaTriggerMaxConcurrency:              1,
+		QuotaTriggerTimeoutSeconds:              20,
+		QuotaTriggerMinAccountCooldownMinutes:   10,
+		ModelPriceAutoUpdateEnabled:             true,
+		ModelPriceUpdateIntervalHours:           6,
+		ModelPriceUpdateURL:                     defaultModelPriceURL,
+		ModelPriceUpdateTimeoutSeconds:          20,
+		UsageRetentionDays:                      90,
+		QuotaTriggerRetentionDays:               30,
+		RequestDetailRetentionDays:              30,
+		SummaryPrecomputeEnabled:                true,
+		SummaryPrecomputeIntervalSeconds:        30,
+		SummaryPrecomputeMode:                   "active_dirty",
+		SummaryCacheMaxAgeSeconds:               5,
+		SummaryMaintenanceIntervalSeconds:       180,
+		SummaryPrecomputeActiveWindowTTLSeconds: 600,
 	}
 }
 
@@ -611,6 +623,18 @@ func parsePluginConfigYAML(raw []byte, cfg pluginConfig) pluginConfig {
 	if value, ok := configValue(values, "summary_precompute_interval_seconds", "预计算间隔秒数"); ok {
 		cfg.SummaryPrecomputeIntervalSeconds = parseInt(value, cfg.SummaryPrecomputeIntervalSeconds, 5, 3600)
 	}
+	if value, ok := configValue(values, "summary_precompute_mode"); ok {
+		cfg.SummaryPrecomputeMode = value
+	}
+	if value, ok := configValue(values, "summary_cache_max_age_seconds"); ok {
+		cfg.SummaryCacheMaxAgeSeconds = parseInt(value, cfg.SummaryCacheMaxAgeSeconds, 1, 3600)
+	}
+	if value, ok := configValue(values, "summary_maintenance_interval_seconds"); ok {
+		cfg.SummaryMaintenanceIntervalSeconds = parseInt(value, cfg.SummaryMaintenanceIntervalSeconds, 10, 3600)
+	}
+	if value, ok := configValue(values, "summary_precompute_active_window_ttl_seconds"); ok {
+		cfg.SummaryPrecomputeActiveWindowTTLSeconds = parseInt(value, cfg.SummaryPrecomputeActiveWindowTTLSeconds, 30, 86400)
+	}
 	return cfg
 }
 
@@ -634,6 +658,19 @@ func normalizePluginConfig(cfg pluginConfig) pluginConfig {
 	cfg.QuotaTriggerRetentionDays = clampInt(cfg.QuotaTriggerRetentionDays, 1, 3650)
 	cfg.RequestDetailRetentionDays = clampInt(cfg.RequestDetailRetentionDays, 1, 3650)
 	cfg.SummaryPrecomputeIntervalSeconds = clampInt(cfg.SummaryPrecomputeIntervalSeconds, 5, 3600)
+	cfg.SummaryCacheMaxAgeSeconds = clampInt(cfg.SummaryCacheMaxAgeSeconds, 1, 3600)
+	cfg.SummaryMaintenanceIntervalSeconds = clampInt(cfg.SummaryMaintenanceIntervalSeconds, 10, 3600)
+	cfg.SummaryPrecomputeActiveWindowTTLSeconds = clampInt(cfg.SummaryPrecomputeActiveWindowTTLSeconds, 30, 86400)
+	precomputeMode := strings.ToLower(strings.TrimSpace(cfg.SummaryPrecomputeMode))
+	switch precomputeMode {
+	case "", "active", "dirty", "active-dirty", "active_dirty":
+		precomputeMode = "active_dirty"
+	case "legacy", "all", "full":
+		precomputeMode = "legacy"
+	default:
+		precomputeMode = "active_dirty"
+	}
+	cfg.SummaryPrecomputeMode = precomputeMode
 	if strings.TrimSpace(cfg.ModelPriceUpdateURL) == "" {
 		cfg.ModelPriceUpdateURL = defaultModelPriceURL
 	}
@@ -777,6 +814,9 @@ func initializeSQLiteStore(ctx context.Context, db *sql.DB) error {
 	if _, err := db.ExecContext(ctx, schemaSQL); err != nil {
 		return err
 	}
+	if err := ensureSummaryCacheColumns(ctx, db); err != nil {
+		return err
+	}
 	if err := normalizeStoredResetColumns(ctx, db); err != nil {
 		return err
 	}
@@ -791,6 +831,44 @@ func initializeSQLiteStore(ctx context.Context, db *sql.DB) error {
 	}
 	if err := ensureAutobanBanColumns(ctx, db); err != nil {
 		return err
+	}
+	return nil
+}
+
+func ensureSummaryCacheColumns(ctx context.Context, db *sql.DB) error {
+	columns := []struct {
+		name string
+		def  string
+	}{
+		{"revision", "TEXT NOT NULL DEFAULT ''"},
+	}
+	existing := map[string]bool{}
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(summary_cache)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			return err
+		}
+		existing[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, column := range columns {
+		if existing[column.name] {
+			continue
+		}
+		if _, err := db.ExecContext(ctx, `ALTER TABLE summary_cache ADD COLUMN `+column.name+` `+column.def); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -1070,29 +1148,38 @@ func (m *dbHealthMonitor) run(ctx context.Context) {
 }
 
 type summaryMaintenanceState struct {
-	Running        bool   `json:"running"`
-	LastRunStarted string `json:"last_run_started_at,omitempty"`
-	LastRunAt      string `json:"last_run_at,omitempty"`
-	LastDurationMs int64  `json:"last_duration_ms"`
-	LastError      string `json:"last_error,omitempty"`
+	Running                        bool   `json:"running"`
+	LastRunStarted                 string `json:"last_run_started_at,omitempty"`
+	LastRunAt                      string `json:"last_run_at,omitempty"`
+	LastDurationMs                 int64  `json:"last_duration_ms"`
+	LastError                      string `json:"last_error,omitempty"`
+	SkippedReason                  string `json:"skipped_reason,omitempty"`
+	LastMode                       string `json:"last_mode,omitempty"`
+	LastRevision                   string `json:"last_revision,omitempty"`
+	LastProcessedUsageEventID      int64  `json:"last_processed_usage_event_id"`
+	LastProcessedQuotaTriggerID    int64  `json:"last_processed_quota_trigger_id"`
+	LastProcessedAuthFilesRevision string `json:"last_processed_auth_files_revision,omitempty"`
 }
 
 type summaryMaintenanceManager struct {
 	mu     sync.Mutex
 	cancel context.CancelFunc
+	cfg    pluginConfig
 	state  summaryMaintenanceState
 }
 
 func (m *summaryMaintenanceManager) configure(cfg pluginConfig) {
+	cfg = normalizePluginConfig(cfg)
 	m.mu.Lock()
 	if m.cancel != nil {
 		m.cancel()
 		m.cancel = nil
 	}
+	m.cfg = cfg
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
 	m.mu.Unlock()
-	go m.loop(ctx)
+	go m.loop(ctx, cfg)
 }
 
 func (m *summaryMaintenanceManager) stop() {
@@ -1110,9 +1197,10 @@ func (m *summaryMaintenanceManager) status() summaryMaintenanceState {
 	return m.state
 }
 
-func (m *summaryMaintenanceManager) loop(ctx context.Context) {
+func (m *summaryMaintenanceManager) loop(ctx context.Context, cfg pluginConfig) {
 	m.run(ctx)
-	ticker := time.NewTicker(30 * time.Second)
+	interval := time.Duration(maxInt(cfg.SummaryMaintenanceIntervalSeconds, 10)) * time.Second
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -1134,26 +1222,93 @@ func (m *summaryMaintenanceManager) run(ctx context.Context) {
 	m.state.Running = true
 	m.state.LastRunStarted = started.Format(time.RFC3339)
 	m.mu.Unlock()
-	err := globalStore.runSummaryMaintenance(ctx)
+
+	revision, revErr := globalStore.currentRevision(ctx)
+	if revErr == nil {
+		m.mu.Lock()
+		unchanged := m.state.LastRevision != "" && m.state.LastRevision == revision.Revision
+		resetDue := revision.NextBanResetAt > 0 && revision.NextBanResetAt <= time.Now().Unix()
+		if unchanged {
+			if resetDue {
+				m.mu.Unlock()
+			} else {
+				m.state.Running = false
+				m.state.LastRunAt = time.Now().Format(time.RFC3339)
+				m.state.LastDurationMs = time.Since(started).Milliseconds()
+				m.state.LastError = ""
+				m.state.SkippedReason = "unchanged"
+				m.state.LastMode = "skip"
+				m.state.LastProcessedUsageEventID = revision.UsageMaxID
+				m.state.LastProcessedQuotaTriggerID = revision.QuotaMaxID
+				m.state.LastProcessedAuthFilesRevision = revision.AuthFilesRevision
+				m.mu.Unlock()
+				return
+			}
+		} else {
+			m.mu.Unlock()
+		}
+	}
+
+	mode := "full"
+	if revErr == nil && m.lightMaintenanceEnough(revision) {
+		mode = "light"
+	}
+	err := globalStore.runSummaryMaintenanceMode(ctx, mode)
+	if err == nil {
+		if after, afterErr := globalStore.currentRevision(ctx); afterErr == nil {
+			revision = after
+			revErr = nil
+		}
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.state.Running = false
 	m.state.LastRunAt = time.Now().Format(time.RFC3339)
 	m.state.LastDurationMs = time.Since(started).Milliseconds()
+	m.state.SkippedReason = ""
+	m.state.LastMode = mode
 	if err != nil && !errors.Is(err, context.Canceled) {
 		m.state.LastError = sanitizeTriggerError(err)
 	} else {
 		m.state.LastError = ""
 	}
+	if err == nil && revErr == nil {
+		m.state.LastRevision = revision.Revision
+		m.state.LastProcessedUsageEventID = revision.UsageMaxID
+		m.state.LastProcessedQuotaTriggerID = revision.QuotaMaxID
+		m.state.LastProcessedAuthFilesRevision = revision.AuthFilesRevision
+	}
+}
+
+func (m *summaryMaintenanceManager) lightMaintenanceEnough(revision storeRevision) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.state.LastRevision == "" {
+		return false
+	}
+	if m.state.LastProcessedAuthFilesRevision != "" && m.state.LastProcessedAuthFilesRevision != revision.AuthFilesRevision {
+		return false
+	}
+	return true
 }
 
 func (s *store) runSummaryMaintenance(ctx context.Context) error {
+	return s.runSummaryMaintenanceMode(ctx, "full")
+}
+
+func (s *store) runSummaryMaintenanceMode(ctx context.Context, mode string) error {
 	_, err := withSQLiteAutoRepair(ctx, s, "summary maintenance", func() (struct{}, error) {
 		db, _, err := s.open(ctx)
 		if err != nil {
 			return struct{}{}, err
 		}
 		now := time.Now().Unix()
+		if err := expireAutobans(ctx, db, now); err != nil {
+			return struct{}{}, err
+		}
+		if strings.EqualFold(mode, "light") {
+			return struct{}{}, nil
+		}
 		if err := backfillAutobansFromUsage(ctx, db, now); err != nil {
 			return struct{}{}, err
 		}
@@ -1161,9 +1316,6 @@ func (s *store) runSummaryMaintenance(ctx context.Context) error {
 			return struct{}{}, err
 		}
 		if err := backfillWorkspaceDeactivatedAuthsFromQuotaTriggerRuns(ctx, db); err != nil {
-			return struct{}{}, err
-		}
-		if err := expireAutobans(ctx, db, now); err != nil {
 			return struct{}{}, err
 		}
 		if err := reconcileAutobansWithQuotaSnapshots(ctx, db, now); err != nil {
