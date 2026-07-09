@@ -6,11 +6,11 @@ on:
       version:
         description: Plugin version without leading v
         required: true
-        default: 0.1.22
+        default: 0.1.23
       tag:
         description: Release tag
         required: true
-        default: v0.1.22
+        default: v0.1.23
 
 permissions:
   contents: write

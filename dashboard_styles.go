@@ -287,6 +287,11 @@ button:disabled{opacity:.45;cursor:not-allowed;transform:none}
 .overview-section .metric .label{display:block;font-size:12px;color:color-mix(in srgb,var(--text) 88%,var(--muted));margin-top:2px}
 .overview-section .metric .label:before{content:none}
 .overview-section .metric .value{margin-top:0;font-size:27px;line-height:1.04}
+.semantic-section .metric{overflow:hidden;border-color:color-mix(in srgb,var(--accent,var(--blue)) 14%,var(--line));background:linear-gradient(180deg,color-mix(in srgb,var(--accent,var(--blue)) 3%,var(--surface)),var(--surface));padding-top:16px}
+.semantic-section .metric .label:before{content:none}
+.semantic-section .metric .label{margin-top:2px}
+.semantic-section .metric .value{margin-top:0}
+.semantic-section .metric-head{min-height:18px}
 .metric-well{margin-top:auto;border:1px solid color-mix(in srgb,var(--accent,var(--blue)) 12%,var(--line));background:color-mix(in srgb,var(--accent,var(--blue)) 4%,var(--surface-3));border-radius:16px;padding:8px 10px;min-height:62px;display:flex;align-items:flex-end}
 .metric-spark{width:100%;height:46px;display:block;overflow:visible}
 .metric-spark .spark-area{fill:color-mix(in srgb,var(--accent,var(--blue)) 14%,transparent)}
@@ -297,8 +302,6 @@ button:disabled{opacity:.45;cursor:not-allowed;transform:none}
 .overview-activity{border:1px solid var(--line);border-radius:22px;background:var(--surface);padding:18px;box-shadow:var(--panel-shadow);display:grid;gap:14px}
 .overview-activity-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap}
 .overview-activity-pill{display:inline-flex;align-items:center;min-height:24px;padding:0 9px;border-radius:999px;background:color-mix(in srgb,var(--ov-green) 12%,var(--surface-3));border:1px solid color-mix(in srgb,var(--ov-green) 18%,var(--line));font-size:10px;font-weight:820;letter-spacing:.14em;color:var(--ov-green);text-transform:uppercase;margin-bottom:8px}
-.overview-activity-title{font-size:13px;font-weight:780;letter-spacing:-.01em}
-.overview-activity-sub{font-size:11px;color:var(--muted);margin-top:4px;max-width:520px}
 .overview-activity-meta{display:grid;gap:8px;justify-items:end}
 .overview-range{font-size:11px;color:var(--muted)}
 .overview-activity-stats{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
@@ -461,7 +464,9 @@ button:disabled{opacity:.45;cursor:not-allowed;transform:none}
 .status-pill.ok{border-color:color-mix(in srgb,var(--green) 28%,var(--line));background:color-mix(in srgb,var(--green) 5%,var(--surface))}
 
 :root[data-host-theme="dark"] .overview-section .metric,
-:root[data-theme="dark"] .overview-section .metric{background:linear-gradient(180deg,color-mix(in srgb,var(--surface-2) 94%,#24211d 6%),color-mix(in srgb,var(--surface) 96%,#171513 4%));border-color:color-mix(in srgb,var(--accent,var(--blue)) 20%,var(--line));box-shadow:0 18px 34px rgba(0,0,0,.24),0 0 0 1px color-mix(in srgb,var(--accent,var(--blue)) 8%,transparent)}
+:root[data-theme="dark"] .overview-section .metric,
+:root[data-host-theme="dark"] .semantic-section .metric,
+:root[data-theme="dark"] .semantic-section .metric{background:linear-gradient(180deg,color-mix(in srgb,var(--surface-2) 94%,#24211d 6%),color-mix(in srgb,var(--surface) 96%,#171513 4%));border-color:color-mix(in srgb,var(--accent,var(--blue)) 20%,var(--line));box-shadow:0 18px 34px rgba(0,0,0,.24),0 0 0 1px color-mix(in srgb,var(--accent,var(--blue)) 8%,transparent)}
 :root[data-host-theme="dark"] .overview-section .metric-hero,
 :root[data-theme="dark"] .overview-section .metric-hero,
 :root[data-host-theme="dark"] .overview-section .metric-mid,

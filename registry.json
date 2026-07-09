@@ -6,7 +6,7 @@
       "name": "CPA Token Usage",
       "description": "Codex account usage, quota tracking, 429 autoban and provider cost dashboard with management-center aligned UI.",
       "author": "zhumengling / letr007",
-      "version": "0.1.22",
+      "version": "0.1.23",
       "repository": "https://github.com/letr007/codex-token-usage",
       "homepage": "https://github.com/letr007/codex-token-usage",
       "license": "MIT",
