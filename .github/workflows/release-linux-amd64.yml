@@ -37,7 +37,7 @@ jobs:
           GOOS: linux
           GOARCH: amd64
           CGO_ENABLED: '1'
-        run: ./package-release.sh dist
+        run: bash ./package-release.sh dist
 
       - name: Verify package
         run: |
