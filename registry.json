@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "codex-token-usage",
+      "name": "CPA Token Usage",
+      "description": "Codex account usage, quota tracking, 429 autoban and provider cost dashboard with management-center aligned UI.",
+      "author": "zhumengling / letr007",
+      "version": "0.1.22",
+      "repository": "https://github.com/letr007/codex-token-usage",
+      "homepage": "https://github.com/letr007/codex-token-usage",
+      "license": "MIT",
+      "tags": [
+        "Management",
+        "Usage",
+        "Codex",
+        "Dashboard"
+      ]
+    }
+  ]
+}
