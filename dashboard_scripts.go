@@ -1564,14 +1564,14 @@ function refreshLanguage(force=false){
 function applyHostTheme(){
   const root=document.documentElement;
   const sources=[document.documentElement,document.body];
-  let hostLooksDark=false, hostLooksLight=false;
+  let hostTheme='';
   try{
     if(window.parent&&window.parent!==window&&window.parent.document){
       sources.unshift(window.parent.document.documentElement,window.parent.document.body);
       const p=window.parent.document.documentElement;
       const theme=(p.getAttribute('data-theme')||p.getAttribute('class')||'').toLowerCase();
-      hostLooksDark=theme.includes('dark')||theme.includes('black');
-      hostLooksLight=theme.includes('light')||theme.includes('white');
+      if(theme.includes('dark')||theme.includes('black'))hostTheme='dark';
+      else if(theme.includes('white')||theme.includes('light'))hostTheme='white';
     }
   }catch(e){}
   const pick=(names)=>{for(const el of sources){if(!el)continue;const cs=getComputedStyle(el);for(const n of names){const v=normalizeColor(cs.getPropertyValue(n));if(v)return v;}}return ''};
@@ -1579,8 +1579,10 @@ function applyHostTheme(){
   const bgNames=['--cpa-bg','--background','--color-background','--body-bg','--el-bg-color-page','--ant-color-bg-layout'];
   const hostBg=pick(bgNames);
   const prefersDark=(()=>{try{return matchMedia('(prefers-color-scheme:dark)').matches}catch(e){return false}})();
-  const dark=hostLooksDark||(!hostLooksLight&&(isDarkColor(hostBg)||(!hostBg&&prefersDark)));
-  root.dataset.hostTheme=dark?'dark':'light';
+  const dark=hostTheme==='dark'||(!hostTheme&&(isDarkColor(hostBg)||(!hostBg&&prefersDark)));
+  if(dark)root.dataset.hostTheme='dark';
+  else if(hostTheme==='white')root.dataset.hostTheme='white';
+  else delete root.dataset.hostTheme;
   set('--cpa-primary',['--cpa-primary','--primary','--color-primary','--el-color-primary','--ant-color-primary','--primary-color']);
   set('--cpa-info',['--cpa-info','--info','--color-info','--el-color-info','--ant-color-info']);
   set('--cpa-success',['--cpa-success','--success','--color-success','--el-color-success','--ant-color-success']);
