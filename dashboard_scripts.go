@@ -1268,6 +1268,14 @@ const i18nEn={
   '慢首包 -':'Slow first token -',
   '输出速度':'Output speed',
   '输出 Token / 秒':'Output tokens / sec',
+  '请求 / 分钟':'Requests / min',
+  'Token / 分钟':'Tokens / min',
+  '请求健康时间线':'Request health timeline',
+  '最近窗口':'Recent window',
+  '空桶':'No traffic',
+  '稳定':'Stable',
+  '波动':'Watch',
+  '异常':'Degraded',
   '风险洞察':'Risk insights',
   '健康 / 异常 / 集中度':'Health / anomalies / concentration',
   '用量趋势':'Usage trend',
@@ -1645,6 +1653,27 @@ function latencyTone(ms){ms=Number(ms||0); return ms>=12000?'slow':ms>0?'fast':'
 function reliableThroughputSample(r){const latency=Number(r.latency_ms||0),ttft=Number(r.ttft_ms||0),ms=Math.max(latency,ttft),out=Number(r.output_tokens||0); return out>0&&ms>=1000&&!(latency===ttft&&out>=1000&&ms<5000)}
 function throughput(r){const ms=Math.max(Number(r.latency_ms||0),Number(r.ttft_ms||0)); const out=Number(r.output_tokens||0); return reliableThroughputSample(r)?Math.round(out/(ms/1000))+' t/s':'-'}
 function avgThroughput(v){v=Number(v||0); return v>0?v.toFixed(v>=10?1:2)+' t/s':'-'}
+function overviewWindowMinutes(win,points){
+  if(win==='24h')return 24*60;
+  if(win==='today')return 24*60;
+  if(win==='7d')return 7*24*60;
+  if(win==='30d')return 30*24*60;
+  if(win==='all'){
+    if((points||[]).length>1){
+      const daily=(String(points[0].bucket||'').length<=10);
+      return (points.length-(daily?0:1))*(daily?24*60:60);
+    }
+    return 24*60;
+  }
+  return 24*60;
+}
+function compactRate(n){
+  n=Number(n||0);
+  if(!n)return '0';
+  if(n>=1e6)return (n/1e6).toFixed(2)+'M';
+  if(n>=1e3)return (n/1e3).toFixed(1)+'K';
+  return n>=100?Math.round(n).toString():n.toFixed(n>=10?1:2);
+}
 function perfTone(r){
   const slow=Number(r.slow_requests||0)+Number(r.slow_ttft_requests||0);
   const failRate=ratio(r.failed||0,r.requests||0);
@@ -1747,6 +1776,7 @@ function renderAll(){
   document.getElementById('m-ttft').textContent=fmtLatencyMs(t.avg_ttft_ms);
   document.getElementById('m-ttft-sub').textContent='慢首包 '+fmt(t.slow_ttft_requests||0);
   document.getElementById('m-throughput').textContent=avgThroughput(t.output_tokens_per_second);
+  renderOverviewDecor(data);
   renderTrend('trend',data.trend||[]);
   renderTokenMix('token-mix',t);
   renderInsights(data);
@@ -1830,6 +1860,80 @@ function renderTokenMix(target,t){
     ['缓存命中',cacheTokens(t),'var(--orange)']
   ];
   document.getElementById(target).innerHTML=rows.map(r=>'<div class="mix-row"><div>'+r[0]+'</div><div class="bar"><span style="--color:'+r[2]+';width:'+Math.min(100,ratio(r[1],total)).toFixed(1)+'%"></span></div><div class="num">'+compact(r[1])+'</div></div>').join('');
+}
+function renderOverviewDecor(data){
+  const points=(data.trend||[]).slice(-36);
+  const total=(data.totals||{}).total_tokens||0;
+  const requests=(data.totals||{}).requests||0;
+  const minutes=Math.max(1,overviewWindowMinutes(document.getElementById('window').value,points));
+  const rpm=requests/minutes;
+  const tpm=total/minutes;
+  const cache=cacheTokens(data.totals||{});
+  document.getElementById('m-rpm').textContent=compactRate(rpm);
+  document.getElementById('m-rpm-sub').textContent=tr('请求 / 分钟')+' · '+fmt(requests)+' '+tr('请求');
+  document.getElementById('m-tpm').textContent=compactRate(tpm);
+  document.getElementById('m-tpm-sub').textContent=tr('Token / 分钟')+' · '+compact(total)+' tok';
+  document.getElementById('m-cache-rate').textContent=pct(cacheRate(data.totals||{}));
+  const cacheBar=document.getElementById('m-cache-bar');
+  if(cacheBar)cacheBar.style.width=Math.max(4,Math.min(100,cacheRate(data.totals||{}))).toFixed(1)+'%';
+  renderMetricSparkline('spark-requests',points,p=>Number(p.requests||0),'var(--blue)');
+  renderMetricSparkline('spark-total',points,p=>Number(p.total_tokens||0),'var(--cyan)');
+  renderMetricSparkline('spark-rpm',points,p=>Number(p.requests||0),'var(--blue)');
+  renderMetricSparkline('spark-tpm',points,p=>Number(p.total_tokens||0),'var(--cyan)');
+  renderMetricSparkline('spark-cost',points,p=>Number(p.total_tokens||0),'var(--violet)');
+  renderHealthTimeline(points);
+}
+function renderMetricSparkline(target,points,pick,color){
+  const svg=document.getElementById(target);
+  if(!svg)return;
+  const values=(points||[]).map(p=>Math.max(0,Number(pick(p)||0)));
+  const w=160,h=44,pad=2;
+  if(!values.length||!values.some(v=>v>0)){
+    svg.innerHTML='<path class="spark-line" d="M'+pad+' '+(h-pad-8)+' L'+(w-pad)+' '+(h-pad-8)+'" style="opacity:.35"></path>';
+    return;
+  }
+  const max=Math.max(1,...values);
+  const point=(v,i)=>{
+    const x=pad+((w-pad*2)*(values.length===1?0:i/(values.length-1)));
+    const y=h-pad-((h-pad*2)*(v/max));
+    return [x,y];
+  };
+  const coords=values.map(point);
+  const line=coords.map((p,i)=>(i?'L':'M')+p[0].toFixed(2)+' '+p[1].toFixed(2)).join(' ');
+  const area=line+' L '+coords[coords.length-1][0].toFixed(2)+' '+(h-pad).toFixed(2)+' L '+coords[0][0].toFixed(2)+' '+(h-pad).toFixed(2)+' Z';
+  const last=coords[coords.length-1];
+  svg.innerHTML='<path class="spark-area" d="'+area+'"></path><path class="spark-line" d="'+line+'"></path><circle class="spark-dot" cx="'+last[0].toFixed(2)+'" cy="'+last[1].toFixed(2)+'" r="2.8"></circle>';
+}
+function renderHealthTimeline(points){
+  const grid=document.getElementById('overview-health-grid');
+  const range=document.getElementById('overview-health-range');
+  const successEl=document.getElementById('overview-health-success');
+  const countsEl=document.getElementById('overview-health-counts');
+  if(!grid||!range||!successEl||!countsEl)return;
+  if(!(points||[]).length){
+    range.textContent=tr('暂无趋势数据');
+    successEl.textContent=tr('成功率 ')+'—';
+    countsEl.textContent=tr('成功 ')+'0 / '+tr('失败 ')+'0';
+    grid.innerHTML='<span class="health-cell empty" title="'+esc(tr('暂无趋势数据'))+'"></span>';
+    return;
+  }
+  const totalReq=points.reduce((sum,p)=>sum+Number(p.requests||0),0);
+  const totalFailed=points.reduce((sum,p)=>sum+Number(p.failed||0),0);
+  const total429=points.reduce((sum,p)=>sum+Number(p.rate_limited||0),0);
+  const totalOk=Math.max(0,totalReq-totalFailed);
+  range.textContent=String(points[0].bucket||'-')+' → '+String(points[points.length-1].bucket||'-');
+  successEl.textContent=tr('成功率 ')+pct(ratio(totalOk,totalReq));
+  countsEl.textContent=tr('成功 ')+fmt(totalOk)+' / '+tr('失败 ')+fmt(totalFailed)+(total429?(' / 429 '+fmt(total429)):'');
+  const cells=points.map(p=>{
+    const req=Number(p.requests||0),failed=Number(p.failed||0),limited=Number(p.rate_limited||0);
+    const ok=Math.max(0,req-failed);
+    const success=req>0?(ok/req):0;
+    const tone=req<=0?'empty':(limited>0||success<.88?'bad':(failed>0||success<.97?'warn':'good'));
+    const title=(p.bucket||'-')+'\n'+tr('成功 ')+fmt(ok)+' / '+tr('失败 ')+fmt(failed)+(limited?(' / 429 '+fmt(limited)):'')+'\n'+tr('成功率 ')+pct(ratio(ok,req));
+    return '<span class="health-cell '+tone+'" title="'+esc(title)+'"></span>';
+  });
+  while(cells.length%7!==0)cells.push('<span class="health-cell empty" aria-hidden="true"></span>');
+  grid.innerHTML=cells.join('');
 }
 function renderTrend(target,points){
   const svg=document.getElementById(target); const w=900,h=270,pad=34;
