@@ -11,9 +11,8 @@ import (
 )
 
 const (
-	reliabilityRows    = 7
-	reliabilityColumns = 96
-	reliabilityBuckets = reliabilityRows * reliabilityColumns
+	reliability24hBuckets = 288
+	reliability7dBuckets  = 336
 )
 
 type reliabilityBucket struct {
@@ -49,6 +48,7 @@ type reliabilityWindow struct {
 	start     time.Time
 	end       time.Time
 	observed  time.Time
+	buckets   int
 }
 
 func reliabilityWindowFor(window string, generatedAt time.Time) reliabilityWindow {
@@ -61,16 +61,21 @@ func reliabilityWindowFor(window string, generatedAt time.Time) reliabilityWindo
 	case "today":
 		y, m, d := generatedAt.Date()
 		start := time.Date(y, m, d, 0, 0, 0, 0, generatedAt.Location())
-		return reliabilityWindow{requested: requested, effective: "today", start: start, end: start.AddDate(0, 0, 1), observed: generatedAt}
+		return reliabilityWindow{requested: requested, effective: "today", start: start, end: start.AddDate(0, 0, 1), observed: generatedAt, buckets: reliability24hBuckets}
 	case "24h":
-		return reliabilityWindow{requested: requested, effective: "24h", start: generatedAt.Add(-24 * time.Hour), end: generatedAt, observed: generatedAt}
+		return reliabilityWindow{requested: requested, effective: "24h", start: generatedAt.Add(-24 * time.Hour), end: generatedAt, observed: generatedAt, buckets: reliability24hBuckets}
 	default:
-		end := generatedAt.Truncate(15 * time.Minute)
-		if end.Before(generatedAt) {
-			end = end.Add(15 * time.Minute)
-		}
-		return reliabilityWindow{requested: requested, effective: "7d", start: end.Add(-7 * 24 * time.Hour), end: end, observed: generatedAt}
+		end := reliabilityHalfHourCeiling(generatedAt)
+		return reliabilityWindow{requested: requested, effective: "7d", start: end.Add(-7 * 24 * time.Hour), end: end, observed: generatedAt, buckets: reliability7dBuckets}
 	}
+}
+
+func reliabilityHalfHourCeiling(generatedAt time.Time) time.Time {
+	if generatedAt.Minute()%30 == 0 && generatedAt.Second() == 0 && generatedAt.Nanosecond() == 0 {
+		return generatedAt
+	}
+	remainingMinutes := 30 - generatedAt.Minute()%30
+	return generatedAt.Add(time.Duration(remainingMinutes)*time.Minute - time.Duration(generatedAt.Second())*time.Second - time.Duration(generatedAt.Nanosecond()))
 }
 
 func reliabilityRate(success, failure int64) float64 {
@@ -82,17 +87,21 @@ func reliabilityRate(success, failure int64) float64 {
 
 func buildReliabilityOverview(plan reliabilityWindow) reliabilityOverview {
 	span := plan.end.Unix() - plan.start.Unix()
+	rows, columns := 6, 48
+	if plan.effective == "7d" {
+		rows, columns = 7, reliability7dBuckets/7
+	}
 	overview := reliabilityOverview{
 		RequestedWindow: plan.requested, EffectiveWindow: plan.effective, Scope: "codex",
-		Rows: reliabilityRows, Columns: reliabilityColumns, Total: reliabilityBuckets,
+		Rows: rows, Columns: columns, Total: plan.buckets,
 		WindowStart: plan.start, WindowEnd: plan.end, ObservedUntil: plan.observed,
-		BucketSpanSeconds: float64(span) / reliabilityBuckets,
-		Buckets:           make([]reliabilityBucket, reliabilityBuckets),
+		BucketSpanSeconds: float64(span) / float64(plan.buckets),
+		Buckets:           make([]reliabilityBucket, plan.buckets),
 		Rate:              -1,
 	}
 	for i := range overview.Buckets {
-		startOffset := (int64(i)*span + reliabilityBuckets - 1) / reliabilityBuckets
-		endOffset := (int64(i+1)*span + reliabilityBuckets - 1) / reliabilityBuckets
+		startOffset := (int64(i)*span + int64(plan.buckets) - 1) / int64(plan.buckets)
+		endOffset := (int64(i+1)*span + int64(plan.buckets) - 1) / int64(plan.buckets)
 		overview.Buckets[i] = reliabilityBucket{
 			Start: plan.start.Add(time.Duration(startOffset) * time.Second),
 			End:   plan.start.Add(time.Duration(endOffset) * time.Second),
@@ -103,7 +112,7 @@ func buildReliabilityOverview(plan reliabilityWindow) reliabilityOverview {
 }
 
 // queryReliability aggregates the complete grid in one range query. Bucket offsets
-// deliberately use the same integer floor formula as the SQL expression.
+// deliberately use the same bucket count and integer floor formula as the SQL expression.
 func queryReliability(ctx context.Context, db *sql.DB, plan reliabilityWindow) (reliabilityOverview, error) {
 	overview := buildReliabilityOverview(plan)
 	span := plan.end.Unix() - plan.start.Unix()
@@ -116,7 +125,7 @@ FROM usage_events
 WHERE requested_at >= ? AND requested_at < ? AND `+usageScopeSQL("codex")+`
 GROUP BY bucket_index
 HAVING bucket_index >= 0 AND bucket_index < ?
-ORDER BY bucket_index ASC`, plan.start.Unix(), reliabilityBuckets, span, plan.start.Unix(), plan.observed.Unix(), reliabilityBuckets)
+ORDER BY bucket_index ASC`, plan.start.Unix(), len(overview.Buckets), span, plan.start.Unix(), plan.observed.Unix(), len(overview.Buckets))
 	if err != nil {
 		return reliabilityOverview{}, err
 	}

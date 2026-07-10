@@ -324,7 +324,7 @@ button:disabled{opacity:.45;cursor:not-allowed;transform:none}
 .health-dot.health-good{background:color-mix(in srgb,var(--ov-green) 64%,#9cc29c 36%)}
 .health-dot.health-warn{background:color-mix(in srgb,var(--ov-orange) 78%,#efc08e 22%)}
 .health-dot.health-bad{background:color-mix(in srgb,var(--ov-red) 74%,#e4a29b 26%)}
-.health-grid{display:grid;grid-auto-flow:column;grid-template-columns:repeat(96,minmax(0,1fr));grid-template-rows:repeat(7,minmax(0,1fr));gap:2px;align-content:start}
+.health-grid{display:grid;grid-auto-flow:column;grid-template-columns:repeat(var(--health-columns,48),minmax(0,1fr));grid-template-rows:repeat(var(--health-rows,7),minmax(0,1fr));gap:2px;align-content:start}
 .health-cell{width:100%;aspect-ratio:1;border-radius:2px;background:var(--surface-3);border:0;box-shadow:none}
 .health-cell.good{background:color-mix(in srgb,var(--ov-green) 72%,var(--surface) 28%);border-color:color-mix(in srgb,var(--ov-green) 44%,var(--line))}
 .health-cell.warn{background:color-mix(in srgb,var(--ov-orange) 78%,var(--surface) 22%);border-color:color-mix(in srgb,var(--ov-orange) 48%,var(--line))}

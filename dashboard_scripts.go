@@ -1254,11 +1254,11 @@ const i18nEn={
   '可靠性数据不可用':'Reliability data unavailable',
   '未来时段':'Future period',
   '无请求':'No requests',
-  '最近24小时，每格约2分9秒':'Last 24 hours · about 2m 9s per cell',
-  '今天完整时段，未来时段留空':'Today · future periods remain empty',
-  '最近7天，每格15分钟':'Last 7 days · 15 minutes per cell',
-  '总览最近30天，可靠性最近7天':'Overview: last 30 days · reliability: last 7 days',
-  '总览全部数据，可靠性最近7天':'Overview: all data · reliability: last 7 days',
+  '最近24小时，每格5分钟':'Last 24 hours · 5 minutes per cell',
+  '今天完整时段，每格约5分钟，未来时段留空':'Today · about 5 minutes per cell · future periods remain empty',
+  '最近7天，每格30分钟':'Last 7 days · 30 minutes per cell',
+  '总览最近30天，可靠性最近7天，每格30分钟':'Overview: last 30 days · reliability: last 7 days at 30-minute resolution',
+  '总览全部数据，可靠性最近7天，每格30分钟':'Overview: all data · reliability: last 7 days at 30-minute resolution',
   '可靠性窗口：':'Reliability window: ',
   '最早':'Oldest',
   '最新':'Newest',
@@ -1977,7 +1977,13 @@ function renderHealthTimeline(reliability){
   ensureHealthTooltip(grid);
   const buckets=Array.isArray(reliability&&reliability.buckets)?reliability.buckets:[];
   const total=Number(reliability&&reliability.total||0);
-  if(!reliability||total!==672||buckets.length!==672){
+  const rows=Number(reliability&&reliability.rows||0);
+  const columns=Number(reliability&&reliability.columns||0);
+  const effectiveWindow=String(reliability&&reliability.effective_window||'');
+  const expectedShape=(effectiveWindow==='24h'||effectiveWindow==='today')?rows===6&&total===288:(effectiveWindow==='7d'?rows===7&&total===336:false);
+  if(!reliability||columns!==48||!expectedShape||total!==rows*columns||buckets.length!==total){
+    grid.style.setProperty('--health-rows','7');
+    grid.style.setProperty('--health-columns','48');
     range.textContent=tr('可靠性数据不可用');
     description.textContent=tr('可靠性数据不可用');
     successEl.className='health-success neutral';
@@ -1986,6 +1992,8 @@ function renderHealthTimeline(reliability){
     grid.innerHTML='<span class="health-unavailable">'+esc(tr('可靠性数据不可用'))+'</span>';
     return;
   }
+  grid.style.setProperty('--health-rows',String(rows));
+  grid.style.setProperty('--health-columns',String(columns));
   const success=Number(reliability.success||0),failure=Number(reliability.failure||0),limited=Number(reliability.rate_limited||0),rate=Number(reliability.rate);
   range.textContent=reliabilityTimeLabel(reliability.window_start)+' → '+reliabilityTimeLabel(reliability.window_end);
   description.textContent=tr(reliabilityDescription(reliability.requested_window,reliability.effective_window));
@@ -1995,7 +2003,7 @@ function renderHealthTimeline(reliability){
   countsEl.innerHTML='<span><i class="health-count-dot"></i>'+esc(tr('成功 ')+fmt(success))+'</span><span><i class="health-count-dot fail"></i>'+esc(tr('失败 ')+fmt(failure))+'</span><span><i class="health-count-dot limit"></i>'+esc(tr('限流 ')+fmt(limited))+'</span>';
   const observedUntil=reliabilityTimestamp(reliability.observed_until);
   const cells=buckets.map(bucket=>{
-    const bucketRate=Number(bucket.rate),start=reliabilityTimeLabel(bucket.start),end=reliabilityTimeLabel(bucket.end);
+    const bucketRate=Number(bucket.rate),start=reliabilityTimeLabel(bucket.start,true),end=reliabilityTimeLabel(bucket.end,true);
     const future=Number.isFinite(observedUntil)&&reliabilityTimestamp(bucket.start)>=observedUntil;
     if(bucketRate<0){
       const emptyText=future?tr('未来时段'):tr('无请求');
@@ -2038,10 +2046,13 @@ function reliabilityTimestamp(value){
   const parsed=Date.parse(String(value||''));
   return Number.isFinite(parsed)?parsed:NaN;
 }
-function reliabilityTimeLabel(value){
+function reliabilityTimeLabel(value,includeOffset=false){
   const source=String(value||'-');
-  const match=source.match(/^\d{4}-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
-  return match?match[1]+'-'+match[2]+' '+match[3]+':'+match[4]:source;
+  const match=source.match(/^\d{4}-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::\d{2}(?:\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/);
+  if(!match)return source;
+  const label=match[1]+'-'+match[2]+' '+match[3]+':'+match[4];
+  if(!includeOffset)return label;
+  return label+(match[5]==='Z'?' UTC':' UTC'+match[5]);
 }
 function reliabilityRateColor(rate){
   const mix=(a,b,t)=>Math.round(a+(b-a)*t);
@@ -2051,11 +2062,11 @@ function reliabilityRateColor(rate){
 }
 function reliabilityDescription(requested,effective){
   const key=String(requested||'');
-  if(key==='24h')return '最近24小时，每格约2分9秒';
-  if(key==='today')return '今天完整时段，未来时段留空';
-  if(key==='7d')return '最近7天，每格15分钟';
-  if(key==='30d')return '总览最近30天，可靠性最近7天';
-  if(key==='all')return '总览全部数据，可靠性最近7天';
+  if(key==='24h')return '最近24小时，每格5分钟';
+  if(key==='today')return '今天完整时段，每格约5分钟，未来时段留空';
+  if(key==='7d')return '最近7天，每格30分钟';
+  if(key==='30d')return '总览最近30天，可靠性最近7天，每格30分钟';
+  if(key==='all')return '总览全部数据，可靠性最近7天，每格30分钟';
   return effective?(tr('可靠性窗口：')+effective):'请求健康时间线';
 }
 function renderTrend(target,points){
