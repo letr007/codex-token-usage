@@ -1239,6 +1239,29 @@ const i18nEn={
   '导出 JSON':'Export JSON',
   '运行总览':'Runtime overview',
   '请求 / Token / 缓存 / 限流':'Requests / tokens / cache / limits',
+  '最近窗口内的请求、Token、缓存与限流概况':'Requests, tokens, cache, and rate limits in the selected window',
+  '请求总量':'Requests',
+  'Token 总量':'Total tokens',
+  '累计请求 ':'Total requests ',
+  '累计 Token ':'Total tokens ',
+  '按总 Token 估算':'Estimated from total tokens',
+  '基于 ':'Based on ',
+  ' Token 估算':' tokens',
+  '限流':'Rate limits',
+  '限流 ':'Rate limits ',
+  '命中 ':'Cache hits ',
+  '按时间桶查看成功、失败与限流。':'Successes, failures, and rate limits by time bucket.',
+  '可靠性数据不可用':'Reliability data unavailable',
+  '未来时段':'Future period',
+  '无请求':'No requests',
+  '最近24小时，每格约2分9秒':'Last 24 hours · about 2m 9s per cell',
+  '今天完整时段，未来时段留空':'Today · future periods remain empty',
+  '最近7天，每格15分钟':'Last 7 days · 15 minutes per cell',
+  '总览最近30天，可靠性最近7天':'Overview: last 30 days · reliability: last 7 days',
+  '总览全部数据，可靠性最近7天':'Overview: all data · reliability: last 7 days',
+  '可靠性窗口：':'Reliability window: ',
+  '最早':'Oldest',
+  '最新':'Newest',
   '请求数':'Requests',
   '成功率 -':'Success -',
   '总 Token':'Total tokens',
@@ -1750,17 +1773,18 @@ function renderAll(){
   document.getElementById('tab-codex-count').textContent=fmt((data.accounts||[]).length);
   document.getElementById('tab-provider-count').textContent=fmt((data.providers||[]).length);
   document.getElementById('m-requests').textContent=fmt(t.requests);
-  document.getElementById('m-success').textContent='成功率 '+pct(ratio(okReq,t.requests));
+  document.getElementById('m-success').textContent=tr('成功 ')+fmt(okReq)+' · '+tr('失败 ')+fmt(t.failed||0)+' · '+tr('成功率 ')+pct(ratio(okReq,t.requests));
   document.getElementById('m-total').textContent=compact(total);
+  document.getElementById('m-token-split').textContent=tr('输入 ')+compact(t.input_tokens)+' · '+tr('输出 ')+compact(t.output_tokens)+' · '+tr('缓存 ')+compact(cacheTokens(t));
   document.getElementById('m-cost').textContent=money(t.cost_usd);
-  document.getElementById('m-cost-sub').textContent=t.cost_available?'模型价格已覆盖':'部分模型缺价格 · '+compact(t.unpriced_tokens||0)+' tok';
+  document.getElementById('m-cost-sub').textContent=tr('基于 ')+compact(total)+tr(' Token 估算')+(t.cost_available?' · '+tr('模型价格已覆盖'):' · '+tr('部分模型缺价格')+' · '+compact(t.unpriced_tokens||0)+' tok');
   document.getElementById('m-input').textContent=compact(t.input_tokens);
   document.getElementById('m-input-share').textContent='占比 '+pct(ratio(t.input_tokens,total));
   document.getElementById('m-output').textContent=compact(t.output_tokens);
   document.getElementById('m-output-share').textContent='占比 '+pct(ratio(t.output_tokens,total));
   const cache=cacheTokens(t);
   document.getElementById('m-cache').textContent=compact(cache);
-  document.getElementById('m-cache-share').textContent='缓存率 '+pct(cacheRate(t))+' · 占总 '+pct(ratio(cache,total));
+  document.getElementById('m-cache-share').textContent=tr('命中 ')+compact(t.cached_tokens)+' / '+tr('输入 ')+compact(t.input_tokens)+' · '+tr('缓存率 ')+pct(cacheRate(t));
   document.getElementById('m-429').textContent=fmt(t.rate_limited);
   document.getElementById('m-bans').textContent=fmt((data.autobans||[]).length);
   document.getElementById('m-accounts').textContent=fmt((data.accounts||[]).length);
@@ -1791,17 +1815,24 @@ function renderAll(){
 function renderProviderPage(data){
   const t=data.provider_totals||{}; const total=t.total_tokens||0; const okReq=(t.requests||0)-(t.failed||0);
   document.getElementById('pm-requests').textContent=fmt(t.requests);
-  document.getElementById('pm-success').textContent='成功率 '+pct(ratio(okReq,t.requests));
+  document.getElementById('pm-success').textContent=tr('成功 ')+fmt(okReq)+' · '+tr('失败 ')+fmt(t.failed||0)+' · '+tr('成功率 ')+pct(ratio(okReq,t.requests));
   document.getElementById('pm-total').textContent=compact(total);
+  document.getElementById('pm-token-split').textContent=tr('输入 ')+compact(t.input_tokens)+' · '+tr('输出 ')+compact(t.output_tokens)+' · '+tr('缓存 ')+compact(cacheTokens(t));
   document.getElementById('pm-cost').textContent=money(t.cost_usd);
-  document.getElementById('pm-cost-sub').textContent=t.cost_available?'模型价格已覆盖':'部分模型缺价格 · '+compact(t.unpriced_tokens||0)+' tok';
+  document.getElementById('pm-cost-sub').textContent=tr('基于 ')+compact(total)+tr(' Token 估算')+(t.cost_available?' · '+tr('模型价格已覆盖'):' · '+tr('部分模型缺价格')+' · '+compact(t.unpriced_tokens||0)+' tok');
   document.getElementById('pm-input').textContent=compact(t.input_tokens);
   document.getElementById('pm-input-share').textContent='占比 '+pct(ratio(t.input_tokens,total));
   document.getElementById('pm-output').textContent=compact(t.output_tokens);
   document.getElementById('pm-output-share').textContent='占比 '+pct(ratio(t.output_tokens,total));
   const cache=cacheTokens(t);
-  document.getElementById('pm-cache').textContent=compact(cache);
-  document.getElementById('pm-cache-share').textContent='缓存率 '+pct(cacheRate(t))+' · 占总 '+pct(ratio(cache,total));
+  document.getElementById('pm-cache').textContent=pct(cacheRate(t));
+  document.getElementById('pm-cache-share').textContent=tr('缓存 ')+compact(cache)+' · '+tr('命中 ')+compact(t.cached_tokens)+' / '+tr('输入 ')+compact(t.input_tokens);
+  const inputBar=document.getElementById('pm-input-bar');
+  if(inputBar)inputBar.style.width=Math.max(0,Math.min(100,ratio(t.input_tokens,total))).toFixed(1)+'%';
+  const outputBar=document.getElementById('pm-output-bar');
+  if(outputBar)outputBar.style.width=Math.max(0,Math.min(100,ratio(t.output_tokens,total))).toFixed(1)+'%';
+  const cacheBar=document.getElementById('pm-cache-bar');
+  if(cacheBar)cacheBar.style.width=Math.max(0,Math.min(100,cacheRate(t))).toFixed(1)+'%';
   document.getElementById('pm-429').textContent=fmt(t.rate_limited);
   document.getElementById('pm-providers').textContent=fmt((data.providers||[]).length);
   document.getElementById('pm-models').textContent=fmt((data.provider_models||[]).length);
@@ -1812,6 +1843,10 @@ function renderProviderPage(data){
   document.getElementById('pm-ttft').textContent=fmtLatencyMs(t.avg_ttft_ms);
   document.getElementById('pm-ttft-sub').textContent='慢首包 '+fmt(t.slow_ttft_requests||0);
   document.getElementById('pm-throughput').textContent=avgThroughput(t.output_tokens_per_second);
+  const points=(data.provider_trend||[]).slice(-96);
+  renderMetricSparkline('spark-provider-requests',points,p=>Number(p.requests||0));
+  renderMetricSparkline('spark-provider-total',points,p=>Number(p.total_tokens||0));
+  renderMetricSparkline('spark-provider-cost',points,p=>Number(p.total_tokens||0));
   renderTokenMix('provider-token-mix',t);
   renderTrend('provider-trend',data.provider_trend||[]);
   renderProviders(data.providers||[],total);
@@ -1862,7 +1897,8 @@ function renderTokenMix(target,t){
   document.getElementById(target).innerHTML=rows.map(r=>'<div class="mix-row"><div>'+r[0]+'</div><div class="bar"><span style="--color:'+r[2]+';width:'+Math.min(100,ratio(r[1],total)).toFixed(1)+'%"></span></div><div class="num">'+compact(r[1])+'</div></div>').join('');
 }
 function renderOverviewDecor(data){
-  const points=(data.trend||[]).slice(-36);
+  const trend=data.trend||[];
+  const points=trend.slice(-96);
   const total=(data.totals||{}).total_tokens||0;
   const requests=(data.totals||{}).requests||0;
   const minutes=Math.max(1,overviewWindowMinutes(document.getElementById('window').value,points));
@@ -1870,24 +1906,28 @@ function renderOverviewDecor(data){
   const tpm=total/minutes;
   const cache=cacheTokens(data.totals||{});
   document.getElementById('m-rpm').textContent=compactRate(rpm);
-  document.getElementById('m-rpm-sub').textContent=tr('请求 / 分钟')+' · '+fmt(requests)+' '+tr('请求');
+  document.getElementById('m-rpm-sub').textContent=tr('累计请求 ')+fmt(requests);
   document.getElementById('m-tpm').textContent=compactRate(tpm);
-  document.getElementById('m-tpm-sub').textContent=tr('Token / 分钟')+' · '+compact(total)+' tok';
+  document.getElementById('m-tpm-sub').textContent=tr('累计 Token ')+compact(total);
   document.getElementById('m-cache-rate').textContent=pct(cacheRate(data.totals||{}));
   const cacheBar=document.getElementById('m-cache-bar');
   if(cacheBar)cacheBar.style.width=Math.max(4,Math.min(100,cacheRate(data.totals||{}))).toFixed(1)+'%';
-  renderMetricSparkline('spark-requests',points,p=>Number(p.requests||0),'var(--blue)');
-  renderMetricSparkline('spark-total',points,p=>Number(p.total_tokens||0),'var(--cyan)');
-  renderMetricSparkline('spark-rpm',points,p=>Number(p.requests||0),'var(--blue)');
-  renderMetricSparkline('spark-tpm',points,p=>Number(p.total_tokens||0),'var(--cyan)');
-  renderMetricSparkline('spark-cost',points,p=>Number(p.total_tokens||0),'var(--violet)');
-  renderHealthTimeline(points);
+  renderMetricSparkline('spark-requests',points,p=>Number(p.requests||0));
+  renderMetricSparkline('spark-total',points,p=>Number(p.total_tokens||0));
+  renderMetricSparkline('spark-rpm',points,p=>Number(p.requests||0));
+  renderMetricSparkline('spark-tpm',points,p=>Number(p.total_tokens||0));
+  renderMetricSparkline('spark-cost',points,p=>Number(p.total_tokens||0));
+  renderHealthTimeline(data.reliability);
 }
-function renderMetricSparkline(target,points,pick,color){
+function renderMetricSparkline(target,points,pick){
   const svg=document.getElementById(target);
   if(!svg)return;
-  const values=(points||[]).map(p=>Math.max(0,Number(pick(p)||0)));
-  const w=160,h=44,pad=2;
+  const rawValues=(points||[]).map(p=>Math.max(0,Number(pick(p)||0)));
+  const values=sampleSparkValues(rawValues,32);
+  const viewBox=(svg.getAttribute('viewBox')||'').trim().split(/[\s,]+/).map(Number);
+  const w=viewBox.length===4&&viewBox[2]>0?viewBox[2]:160;
+  const h=viewBox.length===4&&viewBox[3]>0?viewBox[3]:44;
+  const pad=Math.max(1,Math.min(w,h)*.035);
   if(!values.length||!values.some(v=>v>0)){
     svg.innerHTML='<path class="spark-line" d="M'+pad+' '+(h-pad-8)+' L'+(w-pad)+' '+(h-pad-8)+'" style="opacity:.35"></path>';
     return;
@@ -1899,41 +1939,124 @@ function renderMetricSparkline(target,points,pick,color){
     return [x,y];
   };
   const coords=values.map(point);
-  const line=coords.map((p,i)=>(i?'L':'M')+p[0].toFixed(2)+' '+p[1].toFixed(2)).join(' ');
+  const line=smoothSparkPath(coords);
   const area=line+' L '+coords[coords.length-1][0].toFixed(2)+' '+(h-pad).toFixed(2)+' L '+coords[0][0].toFixed(2)+' '+(h-pad).toFixed(2)+' Z';
-  const last=coords[coords.length-1];
-  svg.innerHTML='<path class="spark-area" d="'+area+'"></path><path class="spark-line" d="'+line+'"></path><circle class="spark-dot" cx="'+last[0].toFixed(2)+'" cy="'+last[1].toFixed(2)+'" r="2.8"></circle>';
+  svg.innerHTML='<path class="spark-area" d="'+area+'"></path><path class="spark-line" d="'+line+'"></path>';
 }
-function renderHealthTimeline(points){
+function sampleSparkValues(values,maxPoints){
+  if(values.length<=maxPoints)return values;
+  const sampled=[];
+  for(let i=0;i<maxPoints;i++){
+    const start=Math.floor(i*values.length/maxPoints),end=Math.floor((i+1)*values.length/maxPoints);
+    sampled.push(values.slice(start,Math.max(start+1,end)).reduce((sum,value)=>sum+value,0));
+  }
+  return sampled;
+}
+function smoothSparkPath(coords){
+  if(coords.length<3)return coords.map((p,i)=>(i?'L':'M')+p[0].toFixed(2)+' '+p[1].toFixed(2)).join(' ');
+  let d='M'+coords[0][0].toFixed(2)+' '+coords[0][1].toFixed(2);
+  for(let i=1;i<coords.length-1;i++){
+    const midX=(coords[i][0]+coords[i+1][0])/2,midY=(coords[i][1]+coords[i+1][1])/2;
+    d+=' Q'+coords[i][0].toFixed(2)+' '+coords[i][1].toFixed(2)+' '+midX.toFixed(2)+' '+midY.toFixed(2);
+  }
+  const last=coords[coords.length-1];
+  return d+' L'+last[0].toFixed(2)+' '+last[1].toFixed(2);
+}
+function renderHealthTimeline(reliability){
   const grid=document.getElementById('overview-health-grid');
   const range=document.getElementById('overview-health-range');
   const successEl=document.getElementById('overview-health-success');
   const countsEl=document.getElementById('overview-health-counts');
-  if(!grid||!range||!successEl||!countsEl)return;
-  if(!(points||[]).length){
-    range.textContent=tr('暂无趋势数据');
-    successEl.textContent=tr('成功率 ')+'—';
-    countsEl.textContent=tr('成功 ')+'0 / '+tr('失败 ')+'0';
-    grid.innerHTML='<span class="health-cell empty" title="'+esc(tr('暂无趋势数据'))+'"></span>';
+  const title=document.getElementById('overview-health-title');
+  const description=document.getElementById('overview-health-description');
+  if(!grid||!range||!successEl||!countsEl||!title||!description)return;
+  title.textContent=tr('请求健康时间线');
+  description.textContent=tr('按时间桶查看成功、失败与限流。');
+  const legend=document.querySelector('.health-legend-timeline');
+  if(legend)legend.innerHTML='<span>'+esc(tr('最早'))+'</span><i class="health-dot health-empty" title="'+esc(tr('空桶'))+'" aria-label="'+esc(tr('空桶'))+'"></i><i class="health-dot health-bad" title="'+esc(tr('异常'))+'" aria-label="'+esc(tr('异常'))+'"></i><i class="health-dot health-warn" title="'+esc(tr('波动'))+'" aria-label="'+esc(tr('波动'))+'"></i><i class="health-dot health-good" title="'+esc(tr('稳定'))+'" aria-label="'+esc(tr('稳定'))+'"></i><span>'+esc(tr('最新'))+'</span>';
+  ensureHealthTooltip(grid);
+  const buckets=Array.isArray(reliability&&reliability.buckets)?reliability.buckets:[];
+  const total=Number(reliability&&reliability.total||0);
+  if(!reliability||total!==672||buckets.length!==672){
+    range.textContent=tr('可靠性数据不可用');
+    description.textContent=tr('可靠性数据不可用');
+    successEl.className='health-success neutral';
+    successEl.innerHTML='<i class="health-status-dot neutral"></i>'+esc(tr('成功率 ')+'—');
+    countsEl.innerHTML='<span><i class="health-count-dot"></i>'+esc(tr('成功 ')+'0')+'</span><span><i class="health-count-dot fail"></i>'+esc(tr('失败 ')+'0')+'</span><span><i class="health-count-dot limit"></i>'+esc(tr('限流 ')+'0')+'</span>';
+    grid.innerHTML='<span class="health-unavailable">'+esc(tr('可靠性数据不可用'))+'</span>';
     return;
   }
-  const totalReq=points.reduce((sum,p)=>sum+Number(p.requests||0),0);
-  const totalFailed=points.reduce((sum,p)=>sum+Number(p.failed||0),0);
-  const total429=points.reduce((sum,p)=>sum+Number(p.rate_limited||0),0);
-  const totalOk=Math.max(0,totalReq-totalFailed);
-  range.textContent=String(points[0].bucket||'-')+' → '+String(points[points.length-1].bucket||'-');
-  successEl.textContent=tr('成功率 ')+pct(ratio(totalOk,totalReq));
-  countsEl.textContent=tr('成功 ')+fmt(totalOk)+' / '+tr('失败 ')+fmt(totalFailed)+(total429?(' / 429 '+fmt(total429)):'');
-  const cells=points.map(p=>{
-    const req=Number(p.requests||0),failed=Number(p.failed||0),limited=Number(p.rate_limited||0);
-    const ok=Math.max(0,req-failed);
-    const success=req>0?(ok/req):0;
-    const tone=req<=0?'empty':(limited>0||success<.88?'bad':(failed>0||success<.97?'warn':'good'));
-    const title=(p.bucket||'-')+'\n'+tr('成功 ')+fmt(ok)+' / '+tr('失败 ')+fmt(failed)+(limited?(' / 429 '+fmt(limited)):'')+'\n'+tr('成功率 ')+pct(ratio(ok,req));
-    return '<span class="health-cell '+tone+'" title="'+esc(title)+'"></span>';
+  const success=Number(reliability.success||0),failure=Number(reliability.failure||0),limited=Number(reliability.rate_limited||0),rate=Number(reliability.rate);
+  range.textContent=reliabilityTimeLabel(reliability.window_start)+' → '+reliabilityTimeLabel(reliability.window_end);
+  description.textContent=tr(reliabilityDescription(reliability.requested_window,reliability.effective_window));
+  const statusTone=rate<0?'':(rate>=.9?'':(rate>=.5?'warn':'bad'));
+  successEl.className=('health-success '+(rate<0?'neutral':statusTone)).trim();
+  successEl.innerHTML='<i class="health-status-dot '+(rate<0?'neutral':statusTone)+'"></i>'+esc(tr('成功率 ')+(rate<0?'—':pct(rate*100)));
+  countsEl.innerHTML='<span><i class="health-count-dot"></i>'+esc(tr('成功 ')+fmt(success))+'</span><span><i class="health-count-dot fail"></i>'+esc(tr('失败 ')+fmt(failure))+'</span><span><i class="health-count-dot limit"></i>'+esc(tr('限流 ')+fmt(limited))+'</span>';
+  const observedUntil=reliabilityTimestamp(reliability.observed_until);
+  const cells=buckets.map(bucket=>{
+    const bucketRate=Number(bucket.rate),start=reliabilityTimeLabel(bucket.start),end=reliabilityTimeLabel(bucket.end);
+    const future=Number.isFinite(observedUntil)&&reliabilityTimestamp(bucket.start)>=observedUntil;
+    if(bucketRate<0){
+      const emptyText=future?tr('未来时段'):tr('无请求');
+      const tooltip=start+' → '+end+'\n'+emptyText;
+      return '<span class="health-cell empty" data-health-tooltip="'+esc(tooltip)+'" aria-label="'+esc(tooltip)+'"></span>';
+    }
+    const bucketSuccess=Number(bucket.success||0),bucketFailure=Number(bucket.failure||0),bucketLimited=Number(bucket.rate_limited||0);
+    const state=tr(bucketRate<.5?'异常':(bucketRate<.9?'波动':'稳定'));
+    const tooltip=state+'\n'+start+' → '+end+'\n'+tr('成功 ')+fmt(bucketSuccess)+' / '+tr('失败 ')+fmt(bucketFailure)+' / '+tr('限流 ')+fmt(bucketLimited)+'\n'+tr('成功率 ')+pct(bucketRate*100);
+    return '<span class="health-cell rate" style="--health-rate:'+reliabilityRateColor(bucketRate)+'" data-health-tooltip="'+esc(tooltip)+'" aria-label="'+esc(tooltip)+'"></span>';
   });
-  while(cells.length%7!==0)cells.push('<span class="health-cell empty" aria-hidden="true"></span>');
   grid.innerHTML=cells.join('');
+}
+function ensureHealthTooltip(grid){
+  if(grid.__healthTooltipBound)return;
+  grid.__healthTooltipBound=true;
+  const tooltip=document.createElement('div');
+  tooltip.className='health-tooltip';
+  tooltip.setAttribute('role','tooltip');
+  document.body.appendChild(tooltip);
+  const hide=()=>tooltip.classList.remove('on');
+  const place=event=>{
+    const margin=12,rect=tooltip.getBoundingClientRect();
+    tooltip.style.left=Math.max(margin,Math.min(window.innerWidth-rect.width-margin,event.clientX+12))+'px';
+    tooltip.style.top=Math.max(margin,Math.min(window.innerHeight-rect.height-margin,event.clientY+12))+'px';
+  };
+  grid.addEventListener('pointerover',event=>{
+    const cell=event.target.closest('.health-cell[data-health-tooltip]');
+    if(!cell||!grid.contains(cell))return;
+    tooltip.textContent=cell.dataset.healthTooltip||'';
+    tooltip.classList.add('on');
+    place(event);
+  });
+  grid.addEventListener('pointermove',event=>{if(tooltip.classList.contains('on'))place(event)});
+  grid.addEventListener('pointerout',event=>{const next=event.relatedTarget&&event.relatedTarget.closest?event.relatedTarget.closest('.health-cell[data-health-tooltip]'):null;if(!next||!grid.contains(next))hide()});
+  grid.addEventListener('pointerleave',hide);
+}
+function reliabilityTimestamp(value){
+  if(typeof value==='number')return value<100000000000?value*1000:value;
+  const parsed=Date.parse(String(value||''));
+  return Number.isFinite(parsed)?parsed:NaN;
+}
+function reliabilityTimeLabel(value){
+  const source=String(value||'-');
+  const match=source.match(/^\d{4}-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
+  return match?match[1]+'-'+match[2]+' '+match[3]+':'+match[4]:source;
+}
+function reliabilityRateColor(rate){
+  const mix=(a,b,t)=>Math.round(a+(b-a)*t);
+  const t=Math.max(0,Math.min(1,rate));
+  const from=t<.5?[239,68,68]:[250,204,21],to=t<.5?[250,204,21]:[34,197,94],local=t<.5?t*2:(t-.5)*2;
+  return 'rgb('+mix(from[0],to[0],local)+','+mix(from[1],to[1],local)+','+mix(from[2],to[2],local)+')';
+}
+function reliabilityDescription(requested,effective){
+  const key=String(requested||'');
+  if(key==='24h')return '最近24小时，每格约2分9秒';
+  if(key==='today')return '今天完整时段，未来时段留空';
+  if(key==='7d')return '最近7天，每格15分钟';
+  if(key==='30d')return '总览最近30天，可靠性最近7天';
+  if(key==='all')return '总览全部数据，可靠性最近7天';
+  return effective?(tr('可靠性窗口：')+effective):'请求健康时间线';
 }
 function renderTrend(target,points){
   const svg=document.getElementById(target); const w=900,h=270,pad=34;

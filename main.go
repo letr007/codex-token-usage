@@ -67,7 +67,7 @@ const (
 )
 
 var (
-	pluginVersion    = "0.1.23"
+	pluginVersion    = "0.1.24"
 	pluginAuthor     = "Codex Token Usage Contributors"
 	pluginRepository = "https://github.com/zhumengling/codex-token-usage"
 )

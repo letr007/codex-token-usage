@@ -697,11 +697,12 @@ func (s *store) summary(ctx context.Context, window string, limit int) (map[stri
 }
 
 func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[string]any, error) {
+	generatedAt := time.Now().Truncate(time.Second)
 	db, path, err := s.open(ctx)
 	if err != nil {
 		return nil, err
 	}
-	since, label := windowStart(window)
+	since, label := windowStartAt(window, generatedAt)
 	totals, err := queryOneTotals(ctx, db, since, "codex")
 	if err != nil {
 		return nil, err
@@ -717,7 +718,11 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 	if err := applyCosts(ctx, db, since, &providerTotals, prices, "other"); err != nil {
 		return nil, err
 	}
-	now := time.Now().Unix()
+	now := generatedAt.Unix()
+	reliability, err := queryReliability(ctx, db, reliabilityWindowFor(window, generatedAt))
+	if err != nil {
+		return nil, err
+	}
 	authDirReadable := configuredAuthDirectoryReadable()
 	accounts, err := queryAccounts(ctx, db, since, limit)
 	if err != nil {
@@ -729,7 +734,7 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 	configuredAccounts := readConfiguredAuthAccounts()
 	accounts = mergeConfiguredAccounts(accounts, configuredAccounts)
 	accounts = filterCurrentConfiguredAccounts(accounts, configuredAccounts, authDirReadable)
-	quotaSince := time.Now().Add(-35 * 24 * time.Hour).Unix()
+	quotaSince := generatedAt.Add(-35 * 24 * time.Hour).Unix()
 	applyLatestQuotaSnapshots(ctx, db, accounts, quotaSince)
 	applySecondaryQuotaEstimates(ctx, db, accounts, &totals, quotaSince)
 	invalidAuths, err := queryActiveInvalidAuths(ctx, db)
@@ -806,7 +811,7 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 	result := map[string]any{
 		"plugin":                      pluginID,
 		"version":                     pluginVersion,
-		"generated_at":                time.Now().Format(time.RFC3339),
+		"generated_at":                generatedAt.Format(time.RFC3339),
 		"window":                      label,
 		"since_unix":                  since,
 		"db_path":                     path,
@@ -819,6 +824,7 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 		"provider_models":             providerModels,
 		"trend":                       trend,
 		"provider_trend":              providerTrend,
+		"reliability":                 reliability,
 		"recent":                      recent,
 		"provider_recent":             providerRecent,
 		"autobans":                    autobans,
@@ -909,7 +915,11 @@ func providerRecentLimit(limit int) int {
 }
 
 func windowStart(window string) (int64, string) {
-	now := time.Now()
+	return windowStartAt(window, time.Now())
+}
+
+func windowStartAt(window string, generatedAt time.Time) (int64, string) {
+	now := generatedAt
 	switch strings.ToLower(strings.TrimSpace(window)) {
 	case "today":
 		y, m, d := now.Date()

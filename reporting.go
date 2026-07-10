@@ -10,6 +10,140 @@ import (
 	"time"
 )
 
+const (
+	reliabilityRows    = 7
+	reliabilityColumns = 96
+	reliabilityBuckets = reliabilityRows * reliabilityColumns
+)
+
+type reliabilityBucket struct {
+	Start       time.Time `json:"start"`
+	End         time.Time `json:"end"`
+	Success     int64     `json:"success"`
+	Failure     int64     `json:"failure"`
+	RateLimited int64     `json:"rate_limited"`
+	Rate        float64   `json:"rate"`
+}
+
+type reliabilityOverview struct {
+	RequestedWindow   string              `json:"requested_window"`
+	EffectiveWindow   string              `json:"effective_window"`
+	Scope             string              `json:"scope"`
+	Rows              int                 `json:"rows"`
+	Columns           int                 `json:"columns"`
+	Total             int                 `json:"total"`
+	WindowStart       time.Time           `json:"window_start"`
+	WindowEnd         time.Time           `json:"window_end"`
+	ObservedUntil     time.Time           `json:"observed_until"`
+	BucketSpanSeconds float64             `json:"bucket_span_seconds"`
+	Success           int64               `json:"success"`
+	Failure           int64               `json:"failure"`
+	RateLimited       int64               `json:"rate_limited"`
+	Rate              float64             `json:"rate"`
+	Buckets           []reliabilityBucket `json:"buckets"`
+}
+
+type reliabilityWindow struct {
+	requested string
+	effective string
+	start     time.Time
+	end       time.Time
+	observed  time.Time
+}
+
+func reliabilityWindowFor(window string, generatedAt time.Time) reliabilityWindow {
+	generatedAt = generatedAt.Truncate(time.Second)
+	requested := strings.ToLower(strings.TrimSpace(window))
+	if requested != "today" && requested != "7d" && requested != "30d" && requested != "all" && requested != "24h" {
+		requested = "24h"
+	}
+	switch requested {
+	case "today":
+		y, m, d := generatedAt.Date()
+		start := time.Date(y, m, d, 0, 0, 0, 0, generatedAt.Location())
+		return reliabilityWindow{requested: requested, effective: "today", start: start, end: start.AddDate(0, 0, 1), observed: generatedAt}
+	case "24h":
+		return reliabilityWindow{requested: requested, effective: "24h", start: generatedAt.Add(-24 * time.Hour), end: generatedAt, observed: generatedAt}
+	default:
+		end := generatedAt.Truncate(15 * time.Minute)
+		if end.Before(generatedAt) {
+			end = end.Add(15 * time.Minute)
+		}
+		return reliabilityWindow{requested: requested, effective: "7d", start: end.Add(-7 * 24 * time.Hour), end: end, observed: generatedAt}
+	}
+}
+
+func reliabilityRate(success, failure int64) float64 {
+	if success+failure == 0 {
+		return -1
+	}
+	return float64(success) / float64(success+failure)
+}
+
+func buildReliabilityOverview(plan reliabilityWindow) reliabilityOverview {
+	span := plan.end.Unix() - plan.start.Unix()
+	overview := reliabilityOverview{
+		RequestedWindow: plan.requested, EffectiveWindow: plan.effective, Scope: "codex",
+		Rows: reliabilityRows, Columns: reliabilityColumns, Total: reliabilityBuckets,
+		WindowStart: plan.start, WindowEnd: plan.end, ObservedUntil: plan.observed,
+		BucketSpanSeconds: float64(span) / reliabilityBuckets,
+		Buckets:           make([]reliabilityBucket, reliabilityBuckets),
+		Rate:              -1,
+	}
+	for i := range overview.Buckets {
+		startOffset := (int64(i)*span + reliabilityBuckets - 1) / reliabilityBuckets
+		endOffset := (int64(i+1)*span + reliabilityBuckets - 1) / reliabilityBuckets
+		overview.Buckets[i] = reliabilityBucket{
+			Start: plan.start.Add(time.Duration(startOffset) * time.Second),
+			End:   plan.start.Add(time.Duration(endOffset) * time.Second),
+			Rate:  -1,
+		}
+	}
+	return overview
+}
+
+// queryReliability aggregates the complete grid in one range query. Bucket offsets
+// deliberately use the same integer floor formula as the SQL expression.
+func queryReliability(ctx context.Context, db *sql.DB, plan reliabilityWindow) (reliabilityOverview, error) {
+	overview := buildReliabilityOverview(plan)
+	span := plan.end.Unix() - plan.start.Unix()
+	rows, err := db.QueryContext(ctx, `
+SELECT CAST((requested_at - ?) * ? / ? AS INTEGER) AS bucket_index,
+       COALESCE(SUM(CASE WHEN failed=0 THEN 1 ELSE 0 END),0),
+       COALESCE(SUM(CASE WHEN failed!=0 THEN 1 ELSE 0 END),0),
+       COALESCE(SUM(CASE WHEN status_code=429 THEN 1 ELSE 0 END),0)
+FROM usage_events
+WHERE requested_at >= ? AND requested_at < ? AND `+usageScopeSQL("codex")+`
+GROUP BY bucket_index
+HAVING bucket_index >= 0 AND bucket_index < ?
+ORDER BY bucket_index ASC`, plan.start.Unix(), reliabilityBuckets, span, plan.start.Unix(), plan.observed.Unix(), reliabilityBuckets)
+	if err != nil {
+		return reliabilityOverview{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var index int
+		var success, failure, rateLimited int64
+		if err := rows.Scan(&index, &success, &failure, &rateLimited); err != nil {
+			return reliabilityOverview{}, err
+		}
+		if index < 0 || index >= len(overview.Buckets) {
+			continue
+		}
+		bucket := &overview.Buckets[index]
+		bucket.Success, bucket.Failure, bucket.RateLimited = success, failure, rateLimited
+		bucket.Rate = reliabilityRate(success, failure)
+		overview.Success += success
+		overview.Failure += failure
+		overview.RateLimited += rateLimited
+	}
+	if err := rows.Err(); err != nil {
+		return reliabilityOverview{}, err
+	}
+	overview.Rate = reliabilityRate(overview.Success, overview.Failure)
+	return overview, nil
+}
+
 func durationToMilliseconds(value int64) int64 {
 	if value <= 0 {
 		return 0
