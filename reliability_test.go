@@ -258,11 +258,12 @@ func TestQueryReliabilityDSTTodayBucketBoundaries(t *testing.T) {
 func TestInvalidAuthReleaseRoute(t *testing.T) {
 	previousStore := globalStore
 	globalStore = &store{}
+	dir := t.TempDir()
+	t.Setenv("CPA_TOKEN_USAGE_DIR", dir)
 	t.Cleanup(func() {
 		globalStore.close()
 		globalStore = previousStore
 	})
-	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
 	ctx := context.Background()
 	db, _, err := globalStore.open(ctx)
 	if err != nil {
@@ -355,11 +356,12 @@ VALUES (?, ?, ?, 'codex', '', 100, ?, ?, ?, 100)`, row.authID, row.authIndex, ro
 func TestInvalidAuthReleaseRouteRejectsNonPost(t *testing.T) {
 	previousStore := globalStore
 	globalStore = &store{}
+	dir := t.TempDir()
+	t.Setenv("CPA_TOKEN_USAGE_DIR", dir)
 	t.Cleanup(func() {
 		globalStore.close()
 		globalStore = previousStore
 	})
-	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
 	resp := handleManagement(managementRequest{Method: "GET", Path: "/v0/management/plugins/" + pluginID + "/invalid-auths/release"})
 	if resp.StatusCode != 405 {
 		t.Fatalf("status = %d, want 405", resp.StatusCode)
