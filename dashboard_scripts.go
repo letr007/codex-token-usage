@@ -225,8 +225,10 @@ function initInvalidAuthControl(){
   document.getElementById('invalid-auth-close').onclick=closeInvalidAuthModal;
   document.getElementById('invalid-auth-close-bottom').onclick=closeInvalidAuthModal;
   document.getElementById('invalid-auth-refresh').onclick=async()=>{setInvalidAuthStatus('正在刷新 401 账号...','');await load(true,true);renderInvalidAuthModal()};
+  document.getElementById('invalid-auth-release-all').onclick=releaseAllInvalidAuths;
   document.getElementById('invalid-auth-delete-all').onclick=deleteAllInvalidAuths;
   document.getElementById('invalid-auth-select-page').onclick=selectCurrentInvalidAuthPage;
+  document.getElementById('invalid-auth-release-selected').onclick=releaseSelectedInvalidAuths;
   document.getElementById('invalid-auth-delete-selected').onclick=deleteSelectedInvalidAuths;
   document.getElementById('invalid-auth-prev').onclick=()=>{invalidAuthPage=Math.max(1,invalidAuthPage-1);renderInvalidAuthModal()};
   document.getElementById('invalid-auth-next').onclick=()=>{invalidAuthPage=invalidAuthPage+1;renderInvalidAuthModal()};
@@ -274,7 +276,7 @@ function openInvalidAuthModal(){
   invalidAuthOAuthUrlEl.hidden=true;
   renderInvalidAuthModal();
   invalidAuthModal.hidden=false;
-  setTimeout(()=>document.getElementById('invalid-auth-delete-selected').focus(),0);
+  setTimeout(()=>document.getElementById('invalid-auth-release-selected').focus(),0);
 }
 function closeInvalidAuthModal(){invalidAuthModal.hidden=true}
 function openWorkspaceDeactivatedModal(){
@@ -410,7 +412,7 @@ function setAuthDeleteProgress(el,text,tone,percent){
   el.innerHTML='<div class="modal-progress-status"><span>'+esc(tr(text))+'</span><b>'+pct+'%</b></div><div class="modal-progress" aria-hidden="true"><span style="width:'+pct+'%"></span></div>';
 }
 function setAuthDeleteButtonsDisabled(prefix,disabled){
-  ['delete-all','delete-selected','all','selected','select-page','refresh','prev','next','close','close-bottom'].forEach(suffix=>{
+  ['release-all','release-selected','delete-all','delete-selected','all','selected','select-page','refresh','prev','next','close','close-bottom'].forEach(suffix=>{
     const el=document.getElementById(prefix+'-'+suffix);
     if(el)el.disabled=disabled;
   });
@@ -433,8 +435,13 @@ function invalidAuthRows(){
     merged.invalid_auth_at=firstText(row&&row.invalidated_at_text,row&&row.invalid_auth_at,account&&account.invalid_auth_at);
     merged.invalid_auth_reason=firstText(row&&row.reason,row&&row.invalid_auth_reason,account&&account.invalid_auth_reason,'401 unauthorized');
     merged.auth_file=firstText(row&&row.auth_file,account&&account.auth_file,row&&row.auth_id,row&&row.auth_index);
-    const identity=row||merged;
-    merged.invalid_auth_identity={auth_id:identity.auth_id||'',auth_index:identity.auth_index||'',source:identity.source||'',auth_file:identity.auth_file||''};
+    const identity={
+      auth_id:firstText(row&&row.auth_id,account&&account.auth_id),
+      auth_index:firstText(row&&row.auth_index,account&&account.auth_index),
+      source:firstText(row&&row.source,account&&account.source),
+      auth_file:firstText(row&&row.auth_file,account&&account.auth_file)
+    };
+    merged.invalid_auth_identity=identity;
     const key=invalidAuthKey(merged);
     if(seen.has(key))return;
     seen.add(key);
@@ -447,6 +454,10 @@ function invalidAuthRows(){
   accounts.filter(r=>r.invalid_auth).forEach(row=>add(row,row));
   out.sort((a,b)=>Date.parse(firstText(b.invalid_auth_at,b.invalidated_at_text,0))-Date.parse(firstText(a.invalid_auth_at,a.invalidated_at_text,0)));
   return out;
+}
+function isStrict401Auth(r){
+  const code=Number(r&&r.last_status_code);
+  return code===401||(!code&&String(r&&r.invalid_auth_reason||r&&r.reason||'').toLowerCase().includes('401 unauthorized'));
 }
 function workspaceDeactivatedRows(){
   const accounts=(lastData&&lastData.accounts)||[];
@@ -553,12 +564,16 @@ function renderInvalidAuthModal(){
   const rows=page.rows;
   const rowKeys=new Set(rows.map(invalidAuthKey));
   invalidAuthSelected=new Set([...invalidAuthSelected].filter(k=>rowKeys.has(k)));
+  const releasableRows=rows.filter(isStrict401Auth);
+  const selectedReleasable=rows.some(r=>invalidAuthSelected.has(invalidAuthKey(r))&&isStrict401Auth(r));
   document.getElementById('invalid-auth-summary').textContent='已选 '+invalidAuthSelected.size+' / 共 '+rows.length+' 个';
   document.getElementById('invalid-auth-page-label').textContent=invalidAuthPage+' / '+page.pages;
   document.getElementById('invalid-auth-prev').disabled=invalidAuthPage<=1;
   document.getElementById('invalid-auth-next').disabled=invalidAuthPage>=page.pages;
   document.getElementById('invalid-auth-select-page').disabled=rows.length===0;
+  document.getElementById('invalid-auth-release-all').disabled=releasableRows.length===0;
   document.getElementById('invalid-auth-delete-all').disabled=rows.length===0;
+  document.getElementById('invalid-auth-release-selected').disabled=!selectedReleasable;
   document.getElementById('invalid-auth-delete-selected').disabled=invalidAuthSelected.size===0;
   if(invalidAuthDeleting)setAuthDeleteButtonsDisabled('invalid-auth',true);
   if(!rows.length){
@@ -571,14 +586,20 @@ function renderInvalidAuthModal(){
     const file=invalidAuthFileName(r);
     const checked=invalidAuthSelected.has(key)?' checked':'';
     const loginBusy=invalidAuthOAuthKey===key?' busy':'';
-    const disabled=file&&!invalidAuthDeleting?'':' disabled';
-    return '<div class="invalid-auth-row'+loginBusy+'" data-key="'+esc(key)+'">'+
+    const releasable=isStrict401Auth(r);
+    const oauthDisabled=invalidAuthDeleting?' disabled':'';
+    const releaseDisabled=!releasable||invalidAuthDeleting?' disabled':'';
+    const deleteDisabled=file&&!invalidAuthDeleting?'':' disabled';
+    return '<div class="invalid-auth-row invalid-auth-release-row'+loginBusy+'" data-key="'+esc(key)+'">'+
       '<label class="invalid-auth-check"><input type="checkbox" data-invalid-check="'+esc(key)+'"'+checked+(invalidAuthDeleting?' disabled':'')+'></label>'+
       '<div class="invalid-auth-main"><b title="'+esc(accountName(r))+'">'+esc(accountName(r))+'</b><span title="'+esc(file||'-')+'">'+esc(file||'非文件型记录')+'</span></div>'+
       '<div class="invalid-auth-meta"><span>'+esc(firstText(r.auth_index,'-'))+'</span><span>'+esc(firstText(r.invalid_auth_at,'-'))+'</span></div>'+
       '<div class="invalid-auth-reason" title="'+esc(r.invalid_auth_reason||'401 unauthorized')+'">'+esc(r.invalid_auth_reason||'401 unauthorized')+'</div>'+
-      '<button class="ghost" type="button" data-invalid-login="'+esc(key)+'">OAuth 登录</button>'+
-      '<button class="ghost danger-ghost" type="button" data-invalid-delete="'+esc(key)+'"'+disabled+'>删除</button>'+
+      '<div class="invalid-auth-row-actions">'+
+        '<button class="ghost" type="button" data-invalid-login="'+esc(key)+'"'+oauthDisabled+'>OAuth 登录</button>'+
+        '<button class="ghost" type="button" data-invalid-release="'+esc(key)+'"'+releaseDisabled+'>解除 401</button>'+
+        '<button class="ghost danger-ghost" type="button" data-invalid-delete="'+esc(key)+'"'+deleteDisabled+'>删除认证文件</button>'+
+      '</div>'+
     '</div>';
   }).join('');
 }
@@ -669,9 +690,11 @@ function handleInvalidAuthListClick(e){
     return;
   }
   const login=e.target.closest('[data-invalid-login]');
-  if(login){startInvalidAuthOAuth(login.dataset.invalidLogin);return}
+  if(login&&!login.disabled){startInvalidAuthOAuth(login.dataset.invalidLogin);return}
+  const release=e.target.closest('[data-invalid-release]');
+  if(release&&!release.disabled){invalidAuthSelected=new Set([release.dataset.invalidRelease]);releaseSelectedInvalidAuths();return}
   const del=e.target.closest('[data-invalid-delete]');
-  if(del){invalidAuthSelected=new Set([del.dataset.invalidDelete]);deleteSelectedInvalidAuths();return}
+  if(del&&!del.disabled){invalidAuthSelected=new Set([del.dataset.invalidDelete]);deleteSelectedInvalidAuths();return}
   const row=e.target.closest('.invalid-auth-row[data-key]');
   if(row){
     const key=row.dataset.key;
@@ -743,6 +766,9 @@ function selectCurrentAutobanReleasePage(){
   renderAutobanReleaseModal();
   setAutobanReleaseStatus('已全选当前页 429 账号。','ok');
 }
+function releaseAllInvalidAuths(){
+  releaseInvalidAuthRows(invalidAuthRows(),'确认解除所有 401 状态？','正在解除所有 401 状态...');
+}
 function deleteAllInvalidAuths(){
   deleteInvalidAuthRows(invalidAuthRows(),'确认删除所有 401 认证文件？','正在删除所有 401 认证文件...');
 }
@@ -752,6 +778,9 @@ function deleteAllWorkspaceDeactivatedAuths(){
 function releaseAllAutobans(){
   releaseAutobanRows(autobanReleaseRows(),'确认解除所有 429 禁用账号？','正在解除所有 429 禁用账号...','all429');
 }
+async function releaseSelectedInvalidAuths(){
+  return releaseInvalidAuthRows(selectedInvalidAuthRows(),'确认解除选中的 401 状态？','正在解除选中的 401 状态...');
+}
 async function deleteSelectedInvalidAuths(){
   return deleteInvalidAuthRows(selectedInvalidAuthRows(),'确认删除选中的 401 认证文件？','正在删除选中的 401 认证文件...');
 }
@@ -760,6 +789,42 @@ async function deleteSelectedWorkspaceDeactivatedAuths(){
 }
 async function releaseSelectedAutobans(){
   return releaseAutobanRows(selectedAutobanReleaseRows(),'确认解除选中的 429 禁用账号？','正在解除选中的 429 禁用账号...','selected');
+}
+async function releaseInvalidAuthRows(rows,confirmText,runningText){
+  rows=(rows||[]).filter(isStrict401Auth);
+  if(!rows.length){setInvalidAuthStatus('没有可解除的 401 账号。','warn');return}
+  const key=managementKey();
+  if(!key){missingInvalidAuthKey();return}
+  if(!confirm(tr(confirmText))){return}
+  setAuthDeleteBusy('invalid-auth',true);
+  setAuthDeleteProgress(invalidAuthStatusEl,runningText,'',18);
+  try{
+    const body={scope:'selected',items:rows.map(invalidAuthReleaseIdentity)};
+    const res=await fetch(managementInvalidAuthReleaseApi,{method:'POST',headers:{Authorization:'Bearer '+key,'Content-Type':'application/json',Accept:'application/json'},body:JSON.stringify(body)});
+    const response=await readResponseBody(res);
+    if(!res.ok){
+      if(res.status===401)rejectManagementKey(key);
+      throw new Error('HTTP '+res.status+' '+response);
+    }
+    const parsed=parseJSONBody(response);
+    setAuthDeleteProgress(invalidAuthStatusEl,'解除成功，正在刷新统计...','ok',72);
+    invalidAuthSelected.clear();
+    await load(true,true);
+    const tone=Number(parsed.skipped||0)||Number(parsed.not_found||0)?'warn':'ok';
+    setAuthDeleteBusy('invalid-auth',false);
+    renderInvalidAuthModal();
+    setInvalidAuthStatus('解除结果：已解除 '+fmt(parsed.released||0)+' 个，跳过 '+fmt(parsed.skipped||0)+' 个，未找到 '+fmt(parsed.not_found||0)+' 个。',tone);
+  }catch(e){
+    setAuthDeleteBusy('invalid-auth',false);
+    renderInvalidAuthModal();
+    setInvalidAuthStatus('解除失败：'+e.message,'bad');
+  }finally{
+    if(invalidAuthDeleting)setAuthDeleteBusy('invalid-auth',false);
+  }
+}
+function invalidAuthReleaseIdentity(row){
+  const identity=row.invalid_auth_identity||row||{};
+  return {auth_id:firstText(identity.auth_id),auth_index:firstText(identity.auth_index),source:firstText(identity.source),auth_file:firstText(identity.auth_file)};
 }
 async function deleteInvalidAuthRows(rows,confirmText,runningText){
   const names=[...new Set(rows.map(invalidAuthFileName).filter(Boolean))];
@@ -957,8 +1022,7 @@ async function handleInvalidAuthOAuthSuccess(management,row){
   setInvalidAuthStatus(released?'OAuth 成功：已解除该 401 状态，统计已刷新。':'OAuth 成功：未解除该 401 状态，统计已刷新。',released?'ok':'warn');
 }
 async function releaseInvalidAuthOAuthRow(management,row){
-  const identity=row.invalid_auth_identity||row;
-  const body={scope:'selected',items:[{auth_id:firstText(identity.auth_id),auth_index:firstText(identity.auth_index),source:firstText(identity.source),auth_file:firstText(identity.auth_file)}]};
+  const body={scope:'selected',items:[invalidAuthReleaseIdentity(row)]};
   const res=await fetch(managementInvalidAuthReleaseApi,{method:'POST',headers:{Authorization:'Bearer '+management,'Content-Type':'application/json',Accept:'application/json'},body:JSON.stringify(body)});
   const response=await readResponseBody(res);
   if(!res.ok){
@@ -1338,7 +1402,8 @@ const i18nEn={
   '关闭 401 管理':'Close 401 manager',
   '关闭 402 管理':'Close 402 manager',
   '关闭 429 管理':'Close 429 manager',
-  '删除所有 401 账号':'Delete all 401 accounts',
+  '解除所有 401':'Release all 401',
+  '删除所有认证文件':'Delete all credential files',
   '删除所有 402 账号':'Delete all 402 accounts',
   '解除所有 429':'Release all 429',
   '已选 0 / 共 0 个':'Selected 0 / 0',
@@ -1346,9 +1411,13 @@ const i18nEn={
   '等待选择 402 账号。':'Waiting for 402 account selection.',
   '等待选择 429 账号。':'Waiting for 429 account selection.',
   '全选当前页':'Select current page',
+  '解除选中 401':'Release selected 401',
+  '删除选中认证文件':'Delete selected credential files',
   '删除选中':'Delete selected',
   '解除选中':'Release selected',
+  '解除 401':'Release 401',
   '解除':'Release',
+  '删除认证文件':'Delete credential file',
   '管理 401 失效账号':'Manage 401 invalid accounts',
   '疑似外部消耗':'Suspected external use',
   '触发异常':'Trigger issues',
@@ -1407,9 +1476,15 @@ const i18nEn={
   '正在刷新 429 账号...':'Refreshing 429 accounts...',
   '请在页面顶部填写 CPA 管理密钥后重试。':'Enter the CPA management key at the top and retry.',
   '没有可删除的认证文件。':'No credential files can be deleted.',
+  '没有可解除的 401 账号。':'No releasable 401 accounts.',
   '已全选当前页 401 账号。':'Selected the current page of 401 accounts.',
   '已全选当前页 402 账号。':'Selected the current page of 402 accounts.',
   '已全选当前页 429 账号。':'Selected the current page of 429 accounts.',
+  '确认解除选中的 401 状态？':'Release the selected 401 states?',
+  '确认解除所有 401 状态？':'Release all 401 states?',
+  '正在解除选中的 401 状态...':'Releasing selected 401 states...',
+  '正在解除所有 401 状态...':'Releasing all 401 states...',
+  '解除结果：已解除 ':'Release results: released ',
   '确认删除选中的 401 认证文件？':'Delete the selected 401 credential files?',
   '确认删除所有 401 认证文件？':'Delete all 401 credential files?',
   '正在删除选中的 401 认证文件...':'Deleting selected 401 credential files...',
