@@ -4,6 +4,7 @@ const dashboardScripts = `
 const managementApi='/v0/management/plugins/__PLUGIN_ID__/summary';
 const managementExportApi='/v0/management/plugins/__PLUGIN_ID__/export';
 const managementAutobanReleaseApi='/v0/management/plugins/__PLUGIN_ID__/autobans/release';
+const managementInvalidAuthReleaseApi='/v0/management/plugins/__PLUGIN_ID__/invalid-auths/release';
 const managementAuthFilesApi='/v0/management/auth-files';
 const managementAuthFieldsApi='/v0/management/auth-files/fields';
 const managementCodexAuthUrlApi='/v0/management/codex-auth-url';
@@ -432,6 +433,8 @@ function invalidAuthRows(){
     merged.invalid_auth_at=firstText(row&&row.invalidated_at_text,row&&row.invalid_auth_at,account&&account.invalid_auth_at);
     merged.invalid_auth_reason=firstText(row&&row.reason,row&&row.invalid_auth_reason,account&&account.invalid_auth_reason,'401 unauthorized');
     merged.auth_file=firstText(row&&row.auth_file,account&&account.auth_file,row&&row.auth_id,row&&row.auth_index);
+    const identity=row||merged;
+    merged.invalid_auth_identity={auth_id:identity.auth_id||'',auth_index:identity.auth_index||'',source:identity.source||'',auth_file:identity.auth_file||''};
     const key=invalidAuthKey(merged);
     if(seen.has(key))return;
     seen.add(key);
@@ -896,14 +899,10 @@ async function startInvalidAuthOAuth(key){
   if(!row){setInvalidAuthStatus('未找到这个 401 账号。','warn');return}
   const management=managementKey();
   if(!management){missingInvalidAuthKey();return}
-  const oldFile=invalidAuthFileName(row);
-  const oldEmail=normalizeEmail(firstText(row.email,row.source));
-  const startedAt=Date.now();
   invalidAuthOAuthKey=key;
   invalidAuthOAuthUrlEl.hidden=true;
   renderInvalidAuthModal();
   try{
-    const before=await fetchAuthFilesForBatch(management);
     setInvalidAuthStatus('正在启动 Codex OAuth 登录...','');
     const res=await fetch(managementCodexAuthUrlApi+'?is_webui=true',{headers:{Authorization:'Bearer '+management,Accept:'application/json'}});
     const body=await readResponseBody(res);
@@ -917,14 +916,14 @@ async function startInvalidAuthOAuth(key){
     invalidAuthOAuthUrlEl.innerHTML='<div class="oauth-link-row"><span>'+tr('授权链接：')+'</span><a class="oauth-open-link" href="'+esc(payload.url)+'" target="_blank" rel="noopener noreferrer">'+esc(tr('打开登录页'))+'</a><button class="ghost oauth-copy-link" type="button" data-oauth-copy="'+esc(payload.url)+'" title="'+esc(payload.url)+'">'+esc(tr('复制授权链接'))+'</button><code title="'+esc(payload.url)+'">'+esc(shortOAuthUrl(payload.url))+'</code></div>';
     window.open(payload.url,'_blank','noopener,noreferrer');
     setInvalidAuthStatus('已打开 Codex OAuth，等待登录完成...','');
-    pollInvalidAuthOAuth(management,payload.state,row,before,startedAt,oldFile,oldEmail);
+    pollInvalidAuthOAuth(management,payload.state,row);
   }catch(e){
     invalidAuthOAuthKey='';
     renderInvalidAuthModal();
     setInvalidAuthStatus('OAuth 启动失败：'+e.message,'bad');
   }
 }
-function pollInvalidAuthOAuth(management,state,row,before,startedAt,oldFile,oldEmail){
+function pollInvalidAuthOAuth(management,state,row){
   if(invalidAuthOAuthTimer)clearInterval(invalidAuthOAuthTimer);
   const deadline=Date.now()+5*60*1000;
   invalidAuthOAuthTimer=setInterval(async()=>{
@@ -940,7 +939,8 @@ function pollInvalidAuthOAuth(management,state,row,before,startedAt,oldFile,oldE
       if(data.status==='wait')return;
       clearInterval(invalidAuthOAuthTimer); invalidAuthOAuthTimer=null; invalidAuthOAuthKey='';
       if(data.status==='error')throw new Error(data.error||'OAuth 失败');
-      await handleInvalidAuthOAuthSuccess(management,row,before,startedAt,oldFile,oldEmail);
+      if(data.status!=='ok')throw new Error(data.error||'OAuth 状态未完成');
+      await handleInvalidAuthOAuthSuccess(management,row);
     }catch(e){
       if(invalidAuthOAuthTimer){clearInterval(invalidAuthOAuthTimer);invalidAuthOAuthTimer=null}
       invalidAuthOAuthKey='';
@@ -949,43 +949,24 @@ function pollInvalidAuthOAuth(management,state,row,before,startedAt,oldFile,oldE
     }
   },3000);
 }
-async function handleInvalidAuthOAuthSuccess(management,row,before,startedAt,oldFile,oldEmail){
-  const after=await fetchAuthFilesForBatch(management);
-  const match=findNewAuthForEmail(before,after,oldEmail,oldFile,startedAt);
-  await load();
+async function handleInvalidAuthOAuthSuccess(management,row){
+  const released=await releaseInvalidAuthOAuthRow(management,row);
+  setInvalidAuthStatus(released?'OAuth 成功：已解除该 401 状态，正在刷新统计...':'OAuth 成功：未解除该 401 状态，正在刷新统计...',released?'ok':'warn');
+  await load(true,false);
   renderInvalidAuthModal();
-  if(match&&fileNameOnly(match.name)===oldFile){
-    setInvalidAuthStatus('OAuth 成功：同名认证文件已更新，401 状态会随刷新解除。','ok');
-    return;
-  }
-  if(match&&oldFile){
-    const ok=confirm(tr('已找到相同邮箱的新认证文件，是否删除旧的 401 文件？')+'\\n'+oldFile+' -> '+fileNameOnly(match.name));
-    if(ok){
-      invalidAuthSelected=new Set([invalidAuthKey(row)]);
-      await deleteSelectedInvalidAuths();
-      return;
-    }
-    setInvalidAuthStatus('OAuth 成功：已找到同邮箱新文件，旧文件未删除。','ok');
-    return;
-  }
-  setInvalidAuthStatus('OAuth 成功，但没有找到相同邮箱的新文件；不会删除旧认证文件。','warn');
+  setInvalidAuthStatus(released?'OAuth 成功：已解除该 401 状态，统计已刷新。':'OAuth 成功：未解除该 401 状态，统计已刷新。',released?'ok':'warn');
 }
-function findNewAuthForEmail(before,after,email,oldFile,startedAt){
-  if(!email)return null;
-  const beforeMap=new Map((before||[]).map(f=>[fileNameOnly(f.name),authFileTimestamp(f)]));
-  const candidates=(after||[]).filter(f=>normalizeEmail(f.email)===email);
-  return candidates.find(f=>{
-    const name=fileNameOnly(f.name);
-    const ts=authFileTimestamp(f);
-    return name===oldFile || !beforeMap.has(name) || ts>=startedAt-5000 || ts>(beforeMap.get(name)||0);
-  })||null;
-}
-function authFileTimestamp(f){
-  const value=firstText(f&&f.modified,f&&f.modtime,f&&f.created_at,f&&f.updated_at,0);
-  const n=Number(value);
-  if(Number.isFinite(n)&&n>0)return n>1e12?n:n*1000;
-  const parsed=Date.parse(value);
-  return Number.isFinite(parsed)?parsed:0;
+async function releaseInvalidAuthOAuthRow(management,row){
+  const identity=row.invalid_auth_identity||row;
+  const body={scope:'selected',items:[{auth_id:firstText(identity.auth_id),auth_index:firstText(identity.auth_index),source:firstText(identity.source),auth_file:firstText(identity.auth_file)}]};
+  const res=await fetch(managementInvalidAuthReleaseApi,{method:'POST',headers:{Authorization:'Bearer '+management,'Content-Type':'application/json',Accept:'application/json'},body:JSON.stringify(body)});
+  const response=await readResponseBody(res);
+  if(!res.ok){
+    if(res.status===401)rejectManagementKey(management);
+    throw new Error('HTTP '+res.status+' '+response);
+  }
+  const result=parseJSONBody(response);
+  return Number(result.released||0)===1&&Array.isArray(result.items)&&result.items[0]&&result.items[0].status==='released';
 }
 function parseJSONBody(body){try{return JSON.parse(body||'{}')}catch(e){return {}}}
 async function readResponseBody(res){const text=await res.text();return text}
@@ -1456,15 +1437,16 @@ const i18nEn={
   'OAuth 启动失败：':'OAuth start failed: ',
   'OAuth 等待超时':'OAuth wait timed out',
   'OAuth 失败':'OAuth failed',
+  'OAuth 状态未完成':'OAuth has not completed',
   'OAuth 登录失败：':'OAuth login failed: ',
   '打开登录页':'Open login page',
   '复制授权链接':'Copy auth link',
   '授权链接已复制。':'Authorization link copied.',
   '复制失败，请右键复制链接。':'Copy failed; right-click the link to copy it.',
-  'OAuth 成功：同名认证文件已更新，401 状态会随刷新解除。':'OAuth succeeded: the same credential file was updated, and the 401 state will clear after refresh.',
-  '已找到相同邮箱的新认证文件，是否删除旧的 401 文件？':'A new credential file with the same email was found. Delete the old 401 file?',
-  'OAuth 成功：已找到同邮箱新文件，旧文件未删除。':'OAuth succeeded: same-email new file found; old file was not deleted.',
-  'OAuth 成功，但没有找到相同邮箱的新文件；不会删除旧认证文件。':'OAuth succeeded, but no new file with the same email was found; the old credential file will not be deleted.',
+  'OAuth 成功：已解除该 401 状态，正在刷新统计...':'OAuth succeeded: the selected 401 state was released; refreshing stats...',
+  'OAuth 成功：未解除该 401 状态，正在刷新统计...':'OAuth succeeded: the selected 401 state was not released; refreshing stats...',
+  'OAuth 成功：已解除该 401 状态，统计已刷新。':'OAuth succeeded: the selected 401 state was released and stats were refreshed.',
+  'OAuth 成功：未解除该 401 状态，统计已刷新。':'OAuth succeeded: the selected 401 state was not released and stats were refreshed.',
   '非文件型记录':'Non-file record',
   '删除或替换认证文件后解除':'Clears after deleting or replacing the credential file',
   '需处理':'Needs action',

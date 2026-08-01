@@ -39,6 +39,7 @@ import "C"
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -67,7 +68,7 @@ const (
 )
 
 var (
-	pluginVersion    = "0.1.25"
+	pluginVersion    = "0.1.26"
 	pluginAuthor     = "Codex Token Usage Contributors"
 	pluginRepository = "https://github.com/zhumengling/codex-token-usage"
 )
@@ -361,6 +362,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 				{Method: "GET", Path: "/plugins/codex-token-usage/summary", Description: "Token usage summary JSON."},
 				{Method: "GET", Path: "/plugins/codex-token-usage/export", Description: "Token usage CSV/JSON export."},
 				{Method: "POST", Path: "/plugins/codex-token-usage/autobans/release", Description: "Manually release active Codex 429 auto-bans."},
+				{Method: "POST", Path: "/plugins/codex-token-usage/invalid-auths/release", Description: "Manually release active Codex invalid-auth records without deleting credentials."},
 			},
 			Resources: []resourceRoute{
 				{Path: "/dashboard", Menu: "Token Usage", Description: "Account token usage dashboard."},
@@ -476,6 +478,26 @@ func handleManagement(req managementRequest) managementResponse {
 			return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "release_failed", "message": err.Error()})
 		}
 		result, err := releaseAutobans(context.Background(), db, body)
+		if err != nil {
+			return jsonResponse(http.StatusBadRequest, map[string]any{"error": "release_failed", "message": err.Error()})
+		}
+		return jsonResponse(http.StatusOK, result)
+	}
+	if req.Path == "/v0/management/plugins/"+pluginID+"/invalid-auths/release" {
+		if !strings.EqualFold(req.Method, http.MethodPost) {
+			return jsonResponse(http.StatusMethodNotAllowed, map[string]any{"error": "method_not_allowed"})
+		}
+		var body invalidAuthReleaseRequest
+		if len(req.Body) > 0 {
+			if err := json.Unmarshal(req.Body, &body); err != nil {
+				return jsonResponse(http.StatusBadRequest, map[string]any{"error": "bad_request", "message": err.Error()})
+			}
+		}
+		db, _, err := globalStore.open(context.Background())
+		if err != nil {
+			return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "release_failed", "message": err.Error()})
+		}
+		result, err := releaseInvalidAuths(context.Background(), db, body)
 		if err != nil {
 			return jsonResponse(http.StatusBadRequest, map[string]any{"error": "release_failed", "message": err.Error()})
 		}
@@ -1652,7 +1674,7 @@ func recordInvalidAuthIfNeeded(ctx context.Context, db *sql.DB, rec usageRecord,
 }
 
 func upsertInvalidAuth(ctx context.Context, db *sql.DB, rec usageRecord, status int, reason, authID, authFile string, authFileMTime int64, invalidatedAt int64) error {
-	_, err := db.ExecContext(ctx, `
+	if _, err := db.ExecContext(ctx, `
 INSERT INTO invalid_auths (
   auth_id, auth_index, source, provider, reason, invalidated_at, active,
   last_status_code, auth_file, auth_file_mtime
@@ -1669,7 +1691,58 @@ ON CONFLICT(auth_id) DO UPDATE SET
   auth_file_mtime=excluded.auth_file_mtime`,
 		trim(authID), trim(rec.AuthIndex), trim(rec.Source), trim(rec.Provider),
 		reason, invalidatedAt, status, authFile, authFileMTime,
-	)
+	); err != nil {
+		return err
+	}
+	return saveInvalidAuthCredentialFingerprint(ctx, db, authID, authFile)
+}
+
+func invalidAuthCredentialFingerprintKey(authID string) string {
+	return "invalid_auth_credential_fingerprint:" + strings.TrimSpace(authID)
+}
+
+func saveInvalidAuthCredentialFingerprint(ctx context.Context, db *sql.DB, authID, authFile string) error {
+	key := invalidAuthCredentialFingerprintKey(authID)
+	fingerprint := invalidAuthCredentialFingerprint(authFile)
+	if fingerprint == "" {
+		_, err := db.ExecContext(ctx, `DELETE FROM store_state WHERE key=?`, key)
+		return err
+	}
+	_, err := db.ExecContext(ctx, `
+INSERT INTO store_state (key, value) VALUES (?, ?)
+ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, fingerprint)
+	return err
+}
+
+func invalidAuthCredentialFingerprint(authFile string) string {
+	authFile = fileNameIfJSON(authFile)
+	authDir := configuredAuthDir()
+	if authFile == "" || authDir == "" {
+		return ""
+	}
+	raw, err := os.ReadFile(filepath.Join(authDir, authFile))
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(raw)
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func invalidAuthCredentialFingerprintChanged(ctx context.Context, db *sql.DB, authID, authFile string) (bool, error) {
+	var previous string
+	err := db.QueryRowContext(ctx, `SELECT value FROM store_state WHERE key=?`, invalidAuthCredentialFingerprintKey(authID)).Scan(&previous)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	current := invalidAuthCredentialFingerprint(authFile)
+	return current != "" && current != previous, nil
+}
+
+func clearInvalidAuthCredentialFingerprint(ctx context.Context, db *sql.DB, authID string) error {
+	_, err := db.ExecContext(ctx, `DELETE FROM store_state WHERE key=?`, invalidAuthCredentialFingerprintKey(authID))
 	return err
 }
 
@@ -1744,11 +1817,12 @@ func clearRecoveredAuthStateIfNeeded(ctx context.Context, db *sql.DB, rec usageR
 UPDATE invalid_auths
 SET active=0
 WHERE active=1
+  AND last_status_code=?
 AND (
   lower(auth_file)=?
   OR lower(auth_id)=?
   OR lower(auth_index)=?
-)`, alias, alias, alias); err != nil {
+)`, http.StatusUnauthorized, alias, alias, alias); err != nil {
 				return err
 			}
 			if _, err := db.ExecContext(ctx, `
@@ -1767,12 +1841,13 @@ AND (
 UPDATE invalid_auths
 SET active=0
 WHERE active=1
+  AND last_status_code=?
 AND (
   lower(auth_id)=?
   OR lower(auth_index)=?
   OR lower(source)=?
   OR lower(auth_file)=?
-)`, alias, alias, alias, alias); err != nil {
+)`, http.StatusUnauthorized, alias, alias, alias, alias); err != nil {
 			return err
 		}
 		if _, err := db.ExecContext(ctx, `
@@ -1853,6 +1928,159 @@ ON CONFLICT(auth_id) DO UPDATE SET
 		primaryPct, primaryReset, secondaryPct, secondaryReset,
 	)
 	return err
+}
+
+type invalidAuthReleaseRequest struct {
+	Scope string                   `json:"scope"`
+	Items []invalidAuthReleaseItem `json:"items"`
+}
+
+type invalidAuthReleaseItem struct {
+	AuthID    string `json:"auth_id"`
+	AuthIndex string `json:"auth_index"`
+	Source    string `json:"source"`
+	AuthFile  string `json:"auth_file"`
+}
+
+type invalidAuthReleaseResult struct {
+	Released int                        `json:"released"`
+	Skipped  int                        `json:"skipped"`
+	NotFound int                        `json:"not_found"`
+	Items    []invalidAuthReleaseDetail `json:"items,omitempty"`
+}
+
+type invalidAuthReleaseDetail struct {
+	AuthID    string `json:"auth_id,omitempty"`
+	AuthIndex string `json:"auth_index,omitempty"`
+	Source    string `json:"source,omitempty"`
+	AuthFile  string `json:"auth_file,omitempty"`
+	Status    string `json:"status"`
+	Reason    string `json:"reason,omitempty"`
+}
+
+func releaseInvalidAuths(ctx context.Context, db *sql.DB, req invalidAuthReleaseRequest) (invalidAuthReleaseResult, error) {
+	scope := strings.ToLower(strings.TrimSpace(req.Scope))
+	if scope != "" && scope != "selected" {
+		return invalidAuthReleaseResult{}, fmt.Errorf("unsupported release scope %q", req.Scope)
+	}
+	rows, err := queryActiveInvalidAuths(ctx, db)
+	if err != nil {
+		return invalidAuthReleaseResult{}, err
+	}
+	var result invalidAuthReleaseResult
+	released := make(map[string]bool, len(req.Items))
+	for _, item := range req.Items {
+		detail := invalidAuthReleaseDetail{
+			AuthID:    strings.TrimSpace(item.AuthID),
+			AuthIndex: strings.TrimSpace(item.AuthIndex),
+			Source:    strings.TrimSpace(item.Source),
+			AuthFile:  strings.TrimSpace(item.AuthFile),
+		}
+		match := -1
+		for i, row := range rows {
+			if released[row.AuthID] {
+				continue
+			}
+			if invalidAuthReleaseItemMatchesRow(item, row) {
+				match = i
+				break
+			}
+		}
+		if match < 0 {
+			result.NotFound++
+			detail.Status = "not_found"
+			result.Items = append(result.Items, detail)
+			continue
+		}
+		row := rows[match]
+		detail.AuthID = row.AuthID
+		detail.AuthIndex = row.AuthIndex
+		detail.Source = row.Source
+		detail.AuthFile = row.AuthFile
+		if !isReleasable401InvalidAuth(row) {
+			result.Skipped++
+			detail.Status = "skipped"
+			detail.Reason = "not_401"
+			result.Items = append(result.Items, detail)
+			continue
+		}
+		ok, err := markInvalidAuthReleased(ctx, db, row)
+		if err != nil {
+			return result, err
+		}
+		if ok {
+			if err := clearInvalidAuthCredentialFingerprint(ctx, db, row.AuthID); err != nil {
+				return result, err
+			}
+			released[row.AuthID] = true
+			result.Released++
+			detail.Status = "released"
+		} else {
+			result.NotFound++
+			detail.Status = "not_found"
+		}
+		result.Items = append(result.Items, detail)
+	}
+	return result, nil
+}
+
+func isReleasable401InvalidAuth(row invalidAuthRow) bool {
+	return row.Active && row.LastStatusCode == http.StatusUnauthorized
+}
+
+func invalidAuthReleaseItemMatchesRow(item invalidAuthReleaseItem, row invalidAuthRow) bool {
+	itemFile := invalidAuthFileIdentity(item.AuthID, item.AuthIndex, item.Source, item.AuthFile)
+	rowFile := invalidAuthFileIdentity(row.AuthID, row.AuthIndex, row.Source, row.AuthFile)
+	if itemFile != "" || rowFile != "" {
+		if itemFile == "" || rowFile == "" || !strings.EqualFold(itemFile, rowFile) {
+			return false
+		}
+	}
+	for _, pair := range [][2]string{
+		{item.AuthID, row.AuthID},
+		{item.AuthIndex, row.AuthIndex},
+		{item.Source, row.Source},
+	} {
+		if !strings.EqualFold(strings.TrimSpace(pair[0]), strings.TrimSpace(pair[1])) {
+			return false
+		}
+	}
+	return true
+}
+
+func invalidAuthFileIdentity(authID, authIndex, source, authFile string) string {
+	for _, value := range []string{authFile, authID, authIndex, source} {
+		if file := fileNameIfJSON(value); file != "" {
+			return file
+		}
+	}
+	return ""
+}
+
+func markInvalidAuthReleased(ctx context.Context, db *sql.DB, row invalidAuthRow) (bool, error) {
+	res, err := db.ExecContext(ctx, `
+UPDATE invalid_auths
+SET active=0
+WHERE active=1
+  AND last_status_code=?
+  AND auth_id=?
+  AND auth_index=?
+  AND source=?
+  AND auth_file=?`,
+		http.StatusUnauthorized,
+		strings.TrimSpace(row.AuthID),
+		strings.TrimSpace(row.AuthIndex),
+		strings.TrimSpace(row.Source),
+		strings.TrimSpace(row.AuthFile),
+	)
+	if err != nil {
+		return false, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected > 0, nil
 }
 
 type autobanReleaseRequest struct {
@@ -3329,6 +3557,9 @@ func clearRecoveredAuthStatesFromUsage(ctx context.Context, db *sql.DB) error {
 		return err
 	}
 	for _, invalid := range invalids {
+		if !isReleasable401InvalidAuth(invalid) {
+			continue
+		}
 		rec := usageRecord{
 			Provider:  firstNonEmptyString(invalid.Provider, "codex"),
 			AuthID:    invalid.AuthID,
@@ -3339,7 +3570,7 @@ func clearRecoveredAuthStatesFromUsage(ctx context.Context, db *sql.DB) error {
 		if !hasLaterSuccessfulUsage(ctx, db, rec, invalid.InvalidatedAt) {
 			continue
 		}
-		if _, err := db.ExecContext(ctx, `UPDATE invalid_auths SET active=0 WHERE active=1 AND auth_id=?`, invalid.AuthID); err != nil {
+		if _, err := db.ExecContext(ctx, `UPDATE invalid_auths SET active=0 WHERE active=1 AND last_status_code=? AND auth_id=?`, http.StatusUnauthorized, invalid.AuthID); err != nil {
 			return err
 		}
 	}
@@ -3399,36 +3630,65 @@ func clearReplacedInvalidAuths(ctx context.Context, db *sql.DB) error {
 		if cfg.AuthFileMTime <= 0 {
 			continue
 		}
-		_, err := db.ExecContext(ctx, `
-UPDATE invalid_auths
-SET active=0
-WHERE active=1
-AND auth_file <> ''
-AND auth_file = ?
-AND ? > invalidated_at`, cfg.AuthFile, cfg.AuthFileMTime)
+		invalids, err := queryActiveInvalidAuths(ctx, db)
 		if err != nil {
 			return err
 		}
-		for _, alias := range configuredAccountMatchAliases(cfg, emailCounts) {
-			if alias == "" {
+		for _, invalid := range invalids {
+			if !isReleasable401InvalidAuth(invalid) || !configuredAccountMatchesInvalidAuth(cfg, emailCounts, invalid) {
 				continue
 			}
-			_, err := db.ExecContext(ctx, `
+			changed, err := configuredCredentialChangedSinceInvalidation(ctx, db, cfg, invalid)
+			if err != nil {
+				return err
+			}
+			if !changed {
+				continue
+			}
+			res, err := db.ExecContext(ctx, `
 UPDATE invalid_auths
 SET active=0
-WHERE active=1
-AND ? > invalidated_at
-AND (
-  lower(auth_id)=?
-  OR lower(auth_index)=?
-  OR lower(source)=?
-)`, cfg.AuthFileMTime, alias, alias, alias)
+WHERE active=1 AND last_status_code=? AND auth_id=?`, http.StatusUnauthorized, invalid.AuthID)
 			if err != nil {
+				return err
+			}
+			affected, err := res.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if affected == 0 {
+				continue
+			}
+			if err := clearInvalidAuthCredentialFingerprint(ctx, db, invalid.AuthID); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+func configuredAccountMatchesInvalidAuth(cfg configuredAccount, emailCounts map[string]int, invalid invalidAuthRow) bool {
+	leftAliases := configuredAccountMatchAliases(cfg, emailCounts)
+	rightAliases := authStateMatchAliases(invalid.AuthID, invalid.AuthIndex, invalid.Source, invalid.AuthFile)
+	if strict := strictAuthStateAliasesForValues(invalid.AuthID, invalid.AuthIndex, invalid.Source, invalid.AuthFile); len(strict) > 0 {
+		leftAliases = normalizeAccountAliases(cfg.AuthFile, cfg.AuthIndex, cfg.ChatGPTAccountID)
+		rightAliases = strict
+	}
+	for _, left := range leftAliases {
+		for _, right := range rightAliases {
+			if left != "" && left == right {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func configuredCredentialChangedSinceInvalidation(ctx context.Context, db *sql.DB, cfg configuredAccount, invalid invalidAuthRow) (bool, error) {
+	if cfg.AuthFileMTime < invalid.AuthFileMTime || cfg.AuthFileMTime <= 0 {
+		return false, nil
+	}
+	return invalidAuthCredentialFingerprintChanged(ctx, db, invalid.AuthID, cfg.AuthFile)
 }
 
 func clearMissingConfiguredAuthState(ctx context.Context, db *sql.DB, configured []configuredAccount, authDirReadable bool) error {

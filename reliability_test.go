@@ -3,6 +3,9 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -249,6 +252,196 @@ func TestQueryReliabilityDSTTodayBucketBoundaries(t *testing.T) {
 				t.Fatalf("DST bucket boundary assigned incorrectly: before=%+v after=%+v", result.Buckets[0], result.Buckets[1])
 			}
 		})
+	}
+}
+
+func TestInvalidAuthReleaseRoute(t *testing.T) {
+	previousStore := globalStore
+	globalStore = &store{}
+	t.Cleanup(func() {
+		globalStore.close()
+		globalStore = previousStore
+	})
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	ctx := context.Background()
+	db, _, err := globalStore.open(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+INSERT INTO invalid_auths (auth_id, auth_index, source, provider, reason, invalidated_at, active, last_status_code, auth_file, auth_file_mtime)
+VALUES ('selected.json', 'selected.json', 'selected@example.com', 'codex', '', 100, 1, 401, 'selected.json', 100)`); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"items":[{"auth_id":"selected.json","auth_index":"selected.json","source":"selected@example.com","auth_file":"selected.json"}]}`)
+	resp := handleManagement(managementRequest{Method: "POST", Path: "/v0/management/plugins/" + pluginID + "/invalid-auths/release", Body: body})
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, resp.Body)
+	}
+	var result invalidAuthReleaseResult
+	if err := json.Unmarshal(resp.Body, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Released != 1 || len(result.Items) != 1 || result.Items[0].Status != "released" {
+		t.Fatalf("unexpected release result: %+v", result)
+	}
+	var active int
+	if err := db.QueryRow(`SELECT active FROM invalid_auths WHERE auth_id='selected.json'`).Scan(&active); err != nil {
+		t.Fatal(err)
+	}
+	if active != 0 {
+		t.Fatalf("selected.json active = %d, want 0", active)
+	}
+}
+
+func TestReleaseInvalidAuthsOnlyReleasesSelectedActive401(t *testing.T) {
+	ctx := context.Background()
+	db := reliabilityTestDB(t)
+	rows := []struct {
+		authID, authIndex, source, authFile string
+		status                              int
+		active                              int
+	}{
+		{"selected.json", "selected.json", "selected@example.com", "selected.json", 401, 1},
+		{"workspace.json", "workspace.json", "workspace@example.com", "workspace.json", 402, 1},
+		{"forbidden.json", "forbidden.json", "forbidden@example.com", "forbidden.json", 403, 1},
+		{"limited.json", "limited.json", "limited@example.com", "limited.json", 429, 1},
+		{"inactive.json", "inactive.json", "inactive@example.com", "inactive.json", 401, 0},
+		{"other.json", "other.json", "other@example.com", "other.json", 401, 1},
+	}
+	for _, row := range rows {
+		if _, err := db.Exec(`
+INSERT INTO invalid_auths (auth_id, auth_index, source, provider, reason, invalidated_at, active, last_status_code, auth_file, auth_file_mtime)
+VALUES (?, ?, ?, 'codex', '', 100, ?, ?, ?, 100)`, row.authID, row.authIndex, row.source, row.active, row.status, row.authFile); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	result, err := releaseInvalidAuths(ctx, db, invalidAuthReleaseRequest{Items: []invalidAuthReleaseItem{
+		{AuthID: "selected.json", AuthIndex: "selected.json", Source: "selected@example.com", AuthFile: "selected.json"},
+		{AuthID: "workspace.json", AuthIndex: "workspace.json", Source: "workspace@example.com", AuthFile: "workspace.json"},
+		{AuthID: "forbidden.json", AuthIndex: "forbidden.json", Source: "forbidden@example.com", AuthFile: "forbidden.json"},
+		{AuthID: "limited.json", AuthIndex: "limited.json", Source: "limited@example.com", AuthFile: "limited.json"},
+		{AuthID: "inactive.json", AuthIndex: "inactive.json", Source: "inactive@example.com", AuthFile: "inactive.json"},
+		{AuthID: "other.json", AuthIndex: "other.json", Source: "wrong@example.com", AuthFile: "other.json"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Released != 1 || result.Skipped != 3 || result.NotFound != 2 {
+		t.Fatalf("unexpected release result: %+v", result)
+	}
+	for _, test := range []struct {
+		authID string
+		active int
+	}{
+		{"selected.json", 0},
+		{"workspace.json", 1},
+		{"forbidden.json", 1},
+		{"limited.json", 1},
+		{"inactive.json", 0},
+		{"other.json", 1},
+	} {
+		var active int
+		if err := db.QueryRow(`SELECT active FROM invalid_auths WHERE auth_id=?`, test.authID).Scan(&active); err != nil {
+			t.Fatal(err)
+		}
+		if active != test.active {
+			t.Fatalf("%s active = %d, want %d", test.authID, active, test.active)
+		}
+	}
+}
+
+func TestInvalidAuthReleaseRouteRejectsNonPost(t *testing.T) {
+	previousStore := globalStore
+	globalStore = &store{}
+	t.Cleanup(func() {
+		globalStore.close()
+		globalStore = previousStore
+	})
+	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
+	resp := handleManagement(managementRequest{Method: "GET", Path: "/v0/management/plugins/" + pluginID + "/invalid-auths/release"})
+	if resp.StatusCode != 405 {
+		t.Fatalf("status = %d, want 405", resp.StatusCode)
+	}
+}
+
+func TestSuccessfulUsageDoesNotClearWorkspaceDeactivatedAuth(t *testing.T) {
+	ctx := context.Background()
+	db := reliabilityTestDB(t)
+	if _, err := db.Exec(`
+INSERT INTO invalid_auths (auth_id, auth_index, source, provider, reason, invalidated_at, active, last_status_code, auth_file, auth_file_mtime)
+VALUES ('workspace.json', 'workspace.json', 'workspace@example.com', 'codex', '402 deactivated_workspace', 100, 1, 402, 'workspace.json', 100)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+INSERT INTO usage_events (requested_at, provider, auth_id, auth_index, source, failed, status_code)
+VALUES (101, 'codex', 'workspace.json', 'workspace.json', 'workspace@example.com', 0, 200)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearRecoveredAuthStatesFromUsage(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	var active int
+	if err := db.QueryRow(`SELECT active FROM invalid_auths WHERE auth_id='workspace.json'`).Scan(&active); err != nil {
+		t.Fatal(err)
+	}
+	if active != 1 {
+		t.Fatalf("workspace.json active = %d, want 1", active)
+	}
+}
+
+func TestClearReplacedInvalidAuthsSameSecondMTime(t *testing.T) {
+	ctx := context.Background()
+	db := reliabilityTestDB(t)
+	authDir := t.TempDir()
+	t.Setenv("CPA_AUTH_DIR", authDir)
+	const authFile = "selected.json"
+	if err := os.WriteFile(filepath.Join(authDir, authFile), []byte(`{"provider":"codex","email":"selected@example.com","access_token":"new-token"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	mtime := time.Unix(1700000000, 0)
+	if err := os.Chtimes(filepath.Join(authDir, authFile), mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	selected := usageRecord{AuthID: "selected.json", AuthIndex: "selected.json", Source: "selected@example.com", Provider: "codex"}
+	if err := upsertInvalidAuth(ctx, db, selected, 401, "401 unauthorized", authFile, authFile, mtime.Unix(), mtime.Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(authDir, "unchanged.json"), []byte(`{"provider":"codex","email":"unchanged@example.com","access_token":"unchanged-token"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filepath.Join(authDir, "unchanged.json"), mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	unchanged := usageRecord{AuthID: "unchanged.json", AuthIndex: "unchanged.json", Source: "unchanged@example.com", Provider: "codex"}
+	if err := upsertInvalidAuth(ctx, db, unchanged, 401, "401 unauthorized", "unchanged.json", "unchanged.json", mtime.Unix(), mtime.Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(authDir, authFile), []byte(`{"provider":"codex","email":"selected@example.com","access_token":"replacement-token"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filepath.Join(authDir, authFile), mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := clearReplacedInvalidAuths(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		authID string
+		active int
+	}{
+		{"selected.json", 0},
+		{"unchanged.json", 1},
+	} {
+		var active int
+		if err := db.QueryRow(`SELECT active FROM invalid_auths WHERE auth_id=?`, test.authID).Scan(&active); err != nil {
+			t.Fatal(err)
+		}
+		if active != test.active {
+			t.Fatalf("%s active = %d, want %d", test.authID, active, test.active)
+		}
 	}
 }
 
