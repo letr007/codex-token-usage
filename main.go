@@ -3094,19 +3094,9 @@ func (s *store) pickAuthOnce(ctx context.Context, req schedulerPickRequest) (sch
 	if err != nil {
 		return schedulerPickResponse{Handled: false}, err
 	}
+	// 维护任务（backfill/expire/reconcile/clear）由 summaryMaintenanceManager
+	// 后台周期执行；热路径只做轻量查询，避免每次 pick 触发全表扫描拖垮 CPU。
 	now := time.Now().Unix()
-	if err := backfillAutobansFromUsage(ctx, db, now); err != nil {
-		return schedulerPickResponse{Handled: false}, err
-	}
-	if err := expireAutobans(ctx, db, now); err != nil {
-		return schedulerPickResponse{Handled: false}, err
-	}
-	if err := reconcileAutobansWithQuotaSnapshots(ctx, db, now); err != nil {
-		return schedulerPickResponse{Handled: false}, err
-	}
-	if err := clearReplacedInvalidAuths(ctx, db); err != nil {
-		return schedulerPickResponse{Handled: false}, err
-	}
 	bans, err := queryActiveAutobans(ctx, db, now)
 	if err != nil {
 		return schedulerPickResponse{Handled: false}, err
@@ -3201,9 +3191,7 @@ func isCodexSchedulerRequest(req schedulerPickRequest) bool {
 }
 
 func expireAutobans(ctx context.Context, db *sql.DB, now int64) error {
-	if err := normalizeStoredResetColumns(ctx, db); err != nil {
-		return err
-	}
+	// normalizeStoredResetColumns 已在数据库初始化迁移时执行。
 	_, err := db.ExecContext(ctx, `UPDATE autoban_bans SET active=0 WHERE active=1 AND reset_at <= ?`, now)
 	return err
 }
