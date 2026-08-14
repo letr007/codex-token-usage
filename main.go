@@ -79,6 +79,7 @@ var globalModelPriceUpdater = &modelPriceUpdateManager{}
 var globalRetentionCleaner = &retentionCleaner{}
 var globalDBHealth = &dbHealthMonitor{}
 var globalSummaryMaintenance = &summaryMaintenanceManager{}
+var globalSQLiteHeavyWork = make(chan struct{}, 1)
 var globalSchedulerDiagnostics = &schedulerDiagnosticsTracker{}
 var globalSummaryPrecomputer = &summaryPrecomputeManager{}
 var codexQuotaURLOverrideForTest string
@@ -420,7 +421,7 @@ func pluginConfigFields() []configField {
 		{Name: "开启后台预计算", Type: "boolean", Description: "是否后台预热常用 summary，减少页面首次等待。默认开启。"},
 		{Name: "预计算间隔秒数", Type: "number", Description: "后台 summary 预热间隔，单位秒。默认 30；低占用模式下只检查活跃脏窗口。"},
 		{Name: "summary_precompute_mode", Type: "enum", Description: "active_dirty=只刷新活跃且变脏窗口；legacy=按旧逻辑刷新全部默认窗口。默认 active_dirty。"},
-		{Name: "summary_cache_max_age_seconds", Type: "number", Description: "相同数据 revision 下 summary 缓存最大复用秒数。默认 5。"},
+		{Name: "summary_cache_max_age_seconds", Type: "number", Description: "summary 缓存刷新间隔；期间持续复用并在到期后后台刷新。默认 30 秒。"},
 		{Name: "summary_maintenance_interval_seconds", Type: "number", Description: "后台状态维护间隔，单位秒；无数据变化会跳过。默认 180。"},
 		{Name: "summary_precompute_active_window_ttl_seconds", Type: "number", Description: "窗口被访问后保留为活跃预计算窗口的时间。默认 600。"},
 	}
@@ -435,6 +436,8 @@ func handleManagement(req managementRequest) managementResponse {
 		}
 	}
 	if strings.HasPrefix(req.Path, "/v0/management/plugins/"+pluginID+"/summary") {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
 		window := firstQuery(req.Query, "window", "24h")
 		limit := parseInt(firstQuery(req.Query, "limit", "50"), 50, 1, 5000)
 		forceRefresh := parseBoolString(firstQuery(req.Query, "refresh", "false"), false)
@@ -442,14 +445,14 @@ func handleManagement(req managementRequest) managementResponse {
 		var data map[string]any
 		var err error
 		if syncRefresh {
-			if err := globalStore.runSummaryMaintenance(context.Background()); err != nil {
+			if err := globalStore.runSummaryMaintenance(ctx); err != nil {
 				return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "summary_failed", "message": err.Error()})
 			}
-			data, err = globalSummaryPrecomputer.summarySync(context.Background(), globalStore, window, limit)
+			data, err = globalSummaryPrecomputer.summarySync(ctx, globalStore, window, limit)
 		} else if forceRefresh {
-			data, err = globalSummaryPrecomputer.summaryFresh(context.Background(), globalStore, window, limit)
+			data, err = globalSummaryPrecomputer.summaryFresh(ctx, globalStore, window, limit)
 		} else {
-			data, err = globalSummaryPrecomputer.summary(context.Background(), globalStore, window, limit)
+			data, err = globalSummaryPrecomputer.summary(ctx, globalStore, window, limit)
 		}
 		if err != nil {
 			return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "summary_failed", "message": err.Error()})
@@ -549,7 +552,7 @@ func defaultPluginConfig() pluginConfig {
 		SummaryPrecomputeEnabled:                true,
 		SummaryPrecomputeIntervalSeconds:        30,
 		SummaryPrecomputeMode:                   "active_dirty",
-		SummaryCacheMaxAgeSeconds:               5,
+		SummaryCacheMaxAgeSeconds:               30,
 		SummaryMaintenanceIntervalSeconds:       180,
 		SummaryPrecomputeActiveWindowTTLSeconds: 600,
 	}
@@ -1237,7 +1240,7 @@ func (m *summaryMaintenanceManager) loop(ctx context.Context, cfg pluginConfig) 
 func (m *summaryMaintenanceManager) run(ctx context.Context) {
 	started := time.Now()
 	m.mu.Lock()
-	if m.state.Running {
+	if m.state.Running || globalSummaryPrecomputer.busy() {
 		m.mu.Unlock()
 		return
 	}
@@ -1319,6 +1322,10 @@ func (s *store) runSummaryMaintenance(ctx context.Context) error {
 }
 
 func (s *store) runSummaryMaintenanceMode(ctx context.Context, mode string) error {
+	if err := acquireSQLiteHeavyWork(ctx); err != nil {
+		return err
+	}
+	defer releaseSQLiteHeavyWork()
 	_, err := withSQLiteAutoRepair(ctx, s, "summary maintenance", func() (struct{}, error) {
 		db, _, err := s.open(ctx)
 		if err != nil {
@@ -1356,6 +1363,28 @@ func (s *store) runSummaryMaintenanceMode(ctx context.Context, mode string) erro
 		return struct{}{}, nil
 	})
 	return err
+}
+
+func acquireSQLiteHeavyWork(ctx context.Context) error {
+	select {
+	case globalSQLiteHeavyWork <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func tryAcquireSQLiteHeavyWork() bool {
+	select {
+	case globalSQLiteHeavyWork <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func releaseSQLiteHeavyWork() {
+	<-globalSQLiteHeavyWork
 }
 
 func normalizeStoredResetColumns(ctx context.Context, db *sql.DB) error {
@@ -3613,14 +3642,17 @@ func clearReplacedInvalidAuths(ctx context.Context, db *sql.DB) error {
 	if len(configured) == 0 {
 		return nil
 	}
+	invalids, err := queryActiveInvalidAuths(ctx, db)
+	if err != nil {
+		return err
+	}
+	if len(invalids) == 0 {
+		return nil
+	}
 	emailCounts := configuredEmailCounts(configured)
 	for _, cfg := range configured {
 		if cfg.AuthFileMTime <= 0 {
 			continue
-		}
-		invalids, err := queryActiveInvalidAuths(ctx, db)
-		if err != nil {
-			return err
 		}
 		for _, invalid := range invalids {
 			if !isReleasable401InvalidAuth(invalid) || !configuredAccountMatchesInvalidAuth(cfg, emailCounts, invalid) {

@@ -51,6 +51,8 @@ let currentLang=effectiveLanguage();
 let loading=false;
 let summaryAbortController=null;
 let summaryStaleRefreshTimer=null;
+const summaryStaleRefreshPending=new Map();
+const summaryStaleRefreshLimit=24;
 const summaryWindowCache=new Map();
 const saved=managementKey(); if(saved) keyEl.value=saved;
 selectedProviders=loadSelectedProviders();
@@ -1790,8 +1792,11 @@ function summaryStatusText(data){
   return text;
 }
 function scheduleStaleSummaryRefresh(win){
+  const attempts=Number(summaryStaleRefreshPending.get(win)||0);
+  if(attempts>=summaryStaleRefreshLimit)return;
+  summaryStaleRefreshPending.set(win,attempts+1);
   clearTimeout(summaryStaleRefreshTimer);
-  summaryStaleRefreshTimer=setTimeout(()=>{if(document.getElementById('window').value===win&&!loading)load(true,false,{keepExisting:true,abortPrevious:true})},2500);
+  summaryStaleRefreshTimer=setTimeout(()=>{if(document.getElementById('window').value===win&&!loading)load(false,false,{keepExisting:true,abortPrevious:true})},2500*Math.min(attempts+1,4));
 }
 async function load(forceRefresh=false,syncRefresh=false,options={}){
   if(loading&&!options.abortPrevious)return;
@@ -1806,11 +1811,12 @@ async function load(forceRefresh=false,syncRefresh=false,options={}){
     const data=await fetchSummary(win,key,forceRefresh,syncRefresh,controller.signal);
     if(controller!==summaryAbortController)return;
     lastData=data;
+    if(!(lastData.precompute&&lastData.precompute.stale))summaryStaleRefreshPending.delete(win);
     summaryWindowCache.set(summaryWindowCacheKey(win),data);
     renderAll();
     st.textContent=summaryStatusText(lastData);
     if(lastData.precompute&&lastData.precompute.stale)scheduleStaleSummaryRefresh(win);
-  }catch(e){if(e.name!=='AbortError')st.textContent=tr('失败')+': '+tr(e.message)}
+  }catch(e){summaryStaleRefreshPending.delete(win);if(e.name!=='AbortError')st.textContent=tr('失败')+': '+tr(e.message)}
   finally{if(controller===summaryAbortController){loading=false;summaryAbortController=null}}
 }
 async function fetchSummary(win,key,forceRefresh=false,syncRefresh=false,signal=null){
